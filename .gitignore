@@ -1,2 +1,5 @@
 .ipynb_checkpoints/
-
+out*
+*.bin
+__pycache__
+*.pyc

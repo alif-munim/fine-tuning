@@ -8,14 +8,14 @@ from torch.nn import functional as F
 
 class LayerNorm(nn.Module):
     
-    def __init__(self):
+    def __init__(self, ndim, bias):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
         
     def forward(self, x):
         # Second parameter 'normalized_shape' is the shape of the input
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+        return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
     
     
 """
@@ -23,7 +23,7 @@ Everything required for SA (single head and multi-head) in one class.
 """
 class CausalSelfAttention(nn.Module):
     
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
@@ -130,7 +130,7 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
-        elif is instance(module, nn.Embedding):
+        elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
      
     def forward(self, idx, targets=None):

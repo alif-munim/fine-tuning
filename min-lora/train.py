@@ -64,7 +64,7 @@ config = {k: globals()[k] for k in config_keys}
 
 backend = 'nccl'
 device = 'cuda'
-dtype = 'bfloat16'
+dtype = 'float32'
 compile = True
 
 # Start single-gpu or ddp (multi-gpu) run
@@ -156,6 +156,7 @@ if init_from == 'scratch':
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 
+model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 
@@ -164,7 +165,7 @@ optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta
     
 # Evaluation and learning rate decay
 @torch.no_grad()
-def estimate_loss()
+def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
@@ -229,7 +230,7 @@ while True:
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
-                    'optimizer': optimizer.state_dict().
+                    'optimizer': optimizer.state_dict(),
                     'model_args': model_args,
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
@@ -265,10 +266,10 @@ while True:
     dt = t1 - t0
     t0 = t1
     if iter_num % log_interval == 0 and master_process:
-        lossf = loss_item() * grad_accum_steps
+        lossf = loss.item() * grad_accum_steps
         if local_iter_num >= 5:
             mfu = raw_model.estimate_mfu(batch_size * grad_accum_steps, dt)
-            running_mfu = mfu if running_mfu = -1.0 else 0.9*running_mfu + 0.1*mfu
+            running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1

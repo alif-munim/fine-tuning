@@ -1,5 +1,12 @@
+## GPT-2
+A basic GPT-2 style transformer model, built step-by-step following Andrej Karpathy's [awesome tutorial](https://youtu.be/kCc8FmEb1nY).
 
-Adding self-attention and training for 5000 steps
+
+
+### Observations
+In summary, adding multiple self-attention heads and increasing context length makes a huge difference!
+
+> Adding self-attention and training for 5000 steps
 ```
 Step 0: train loss 4.3117, val loss 4.3153
 Step 4800: train loss 2.4720, val loss 2.4899
@@ -31,7 +38,7 @@ Sadsal this ghesthidin cour ay aney Iry ts I fr t ce.
 J
 ```
 
-Adding multi-head self-attention, decreasing learning rate, increase embed dim and number of heads
+> Adding multi-head self-attention, decreasing learning rate, increase embed dim and number of heads
 ```
 Step 0: train loss 4.3611, val loss 4.3592
 Step 4500: train loss 1.8116, val loss 1.9537
@@ -46,7 +53,7 @@ Someet the to shad mised jess
 An
 ```
 
-Increasing batch size to 64 and block size to 256
+> Increasing batch size to 64 and block size to 256
 ```
 Step 0: train loss 4.2846, val loss 4.2820
 Step 4500: train loss 1.0811, val loss 1.4799
