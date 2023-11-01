@@ -119,16 +119,16 @@ class GPT(nn.Module):
         self.config = config
         
         self.transformer = nn.ModuleDict(dict(
-            t_emb = nn.Embedding(config.vocab_size, config.n_embd),
-            p_emb = nn.Embedding(config.block_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
             dropout = nn.Dropout(config.dropout),
-            blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias)
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
         # Weight tying (?)
-        self.transformer.t_emb.weight = self.lm_head.weight
+        self.transformer.wte.weight = self.lm_head.weight
         
         self.apply(self._init_weights)
         
@@ -150,15 +150,15 @@ class GPT(nn.Module):
         
         # The possible positions of a token given the time (t) sequence dim
         pos = torch.arange(0, t, dtype=torch.long, device=device)
-        pos_emb = self.transformer.p_emb(pos)
+        pos_emb = self.transformer.wpe(pos)
         
         # Token embeddings
-        tok_emb = self.transformer.t_emb(idx)
+        tok_emb = self.transformer.wte(idx)
         
         # Add embeddings and pass through all of the transformer blocks
         # Finally, apply layer normalization to output
         x = self.transformer.dropout(tok_emb + pos_emb)
-        for block in self.transformer.blocks:
+        for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
         
@@ -195,7 +195,7 @@ class GPT(nn.Module):
         
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
-            n_params -= self.transformer.p_emb.weight.numel()
+            n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
 
@@ -218,9 +218,11 @@ class GPT(nn.Module):
         return mfu
     
     # TODO: implement loading from pre-trained
+    @classmethod 
     def from_pretrained(cls, model_type, override_args=None):
+        print("model_type: ", model_type)
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {}
+        override_args = override_args or {} # default to empty dict
         assert all(k == 'dropout' for k in override_args) # Only dropout can be overwritten
         from transformers import GPT2LMHeadModel
         print(f'Loading weights from pre-trained GPT: {model_type}')
@@ -238,7 +240,7 @@ class GPT(nn.Module):
         config_args['bias'] = True
         
         if 'dropout' in override_args:
-            print(f'Overriding dropout rate to {override_args['dropout']}')
+            print(f"Overriding dropout rate to {override_args['dropout']}")
             config_args['dropout'] = override_args['dropout']
             
         config = GPTConfig(**config_args)
@@ -276,8 +278,8 @@ class GPT(nn.Module):
     def crop_block_size(self, block_size):
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.p_emb.weight = nn.Parameter(self.transformer.p_emb.weight[:block_size])
-        for block in self.transformer.blocks:
+        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
     
