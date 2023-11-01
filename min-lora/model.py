@@ -114,6 +114,7 @@ class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        
         self.transformer = nn.ModuleDict(dict(
             t_emb = nn.Embedding(config.vocab_size, config.n_embd),
             p_emb = nn.Embedding(config.block_size, config.n_embd),
@@ -122,6 +123,10 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias)
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
+        # Weight tying (?)
+        self.transformer.t_emb.weight = self.lm_head.weight
+        
         self.apply(self._init_weights)
         
     # Initialize weights: _ following a function name denotes in-place operation
