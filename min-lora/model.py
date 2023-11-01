@@ -25,6 +25,7 @@ class CausalSelfAttention(nn.Module):
     
     def __init__(self, config):
         super().__init__()
+        assert config.n_embd % config.n_head == 0
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         
@@ -113,6 +114,8 @@ class GPT(nn.Module):
     
     def __init__(self, config):
         super().__init__()
+        assert config.vocab_size is not None
+        assert config.block_size is not None
         self.config = config
         
         self.transformer = nn.ModuleDict(dict(
@@ -143,6 +146,7 @@ class GPT(nn.Module):
         # The input idx denotes word (token) indices according to our dictionary
         device = idx.device
         b, t = idx.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence length {t}, block size is only {self.config.block_size}"
         
         # The possible positions of a token given the time (t) sequence dim
         pos = torch.arange(0, t, dtype=torch.long, device=device)
@@ -214,3 +218,90 @@ class GPT(nn.Module):
         return mfu
     
     # TODO: implement loading from pre-trained
+    def from_pretrained(cls, model_type, override_args=None):
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        override_args = override_args or {}
+        assert all(k == 'dropout' for k in override_args) # Only dropout can be overwritten
+        from transformers import GPT2LMHeadModel
+        print(f'Loading weights from pre-trained GPT: {model_type}')
+        
+        config_args = {
+            'gpt2': dict(n_layer=12, n_head=12, n_embd=768), # 124M params
+            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024), # 124M params
+            'gpt2-large': dict(n_layer=36, n_head=120, n_embd=1280), # 124M params
+            'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600), # 124M params
+        }[model_type]
+        
+        print("Forcing vocab_size=50257, block_size=1024, bias=True (GPT checkpoint pre-reqs)")
+        config_args['vocab_size'] = 50257
+        config_args['block_size'] = 1024
+        config_args['bias'] = True
+        
+        if 'dropout' in override_args:
+            print(f'Overriding dropout rate to {override_args['dropout']}')
+            config_args['dropout'] = override_args['dropout']
+            
+        config = GPTConfig(**config_args)
+        model = GPT(config)
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        
+        # Discard the .attn.bias mask/buffer (?)
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
+        
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+        
+        # Copy HF state dict
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
+        
+        # OpenAI checkpoints use Conv1D instead of Linear, so weights need to be transposed before import
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf) != {len(sd_keys)}}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+        return model
+    
+    
+    #TODO: Crop block size if needed
+    def crop_block_size(self, block_size):
+        assert block_size <= self.config.block_size
+        self.config.block_size = block_size
+        self.transformer.p_emb.weight = nn.Parameter(self.transformer.p_emb.weight[:block_size])
+        for block in self.transformer.blocks:
+            if hasattr(block.attn, 'bias'):
+                block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
+    
+    
+    #TODO: Implement generation function
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+        
+        for _ in range(max_new_tokens):
+            
+            # Crop sequence to block size 
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / temperature
+            
+            # Crop logits to top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+                
+            # Calculate probs and sample from distribution
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=-1)
+        
+        return idx
+                
+        
