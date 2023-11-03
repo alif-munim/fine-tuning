@@ -28,6 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+import tiktoken
 
 out_dir = 'out'
 eval_interval = 2000
@@ -171,6 +172,7 @@ elif init_from == 'resume':
 
         
 if block_size < model.config.block_size:
+    print(f"Cropping initial block size {model.config.block_size} to {block_size}")
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size
     
@@ -185,6 +187,7 @@ if compile:
     model = torch.compile(model) 
 
 if ddp:
+    print("initializing distributed training (DDP)")
     model = DDP(model, device_ids=[ddp_local_rank])
 
 @torch.no_grad()
@@ -224,6 +227,8 @@ t0 = time.time()
 local_iter_num = 0 
 raw_model = model.module if ddp else model 
 running_mfu = -1.0
+enc = tiktoken.get_encoding("gpt2")
+
 while True:
 
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -233,6 +238,10 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        
+        # sample_generation = model.generate(X, max_new_tokens=100)
+        # decoded_generation = enc.decode(sample_generation[0].tolist())
+        # print(f'\n\nSample Generation: \n{decoded_generation}\n\n')
         
         if wandb_log:
             wandb.log({
@@ -255,7 +264,8 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                checkpoint_name = dataset + '_' +  init_from + '_' + 'ckpt.pt'
+                torch.save(checkpoint, os.path.join(out_dir, checkpoint_name))
     if iter_num == 0 and eval_only:
         break
 

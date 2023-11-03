@@ -25,7 +25,7 @@ class CausalSelfAttention(nn.Module):
     
     def __init__(self, config):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
+        assert config.n_embd % config.n_head == 0, f"Embedding size {config.n_embd} is not divisible by number of heads {config.n_head}"
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         
@@ -230,7 +230,7 @@ class GPT(nn.Module):
         config_args = {
             'gpt2': dict(n_layer=12, n_head=12, n_embd=768), # 124M params
             'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024), # 124M params
-            'gpt2-large': dict(n_layer=36, n_head=120, n_embd=1280), # 124M params
+            'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280), # 124M params
             'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600), # 124M params
         }[model_type]
         
@@ -251,7 +251,7 @@ class GPT(nn.Module):
         # Discard the .attn.bias mask/buffer (?)
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
         
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type, resume_download=True)
         sd_hf = model_hf.state_dict()
         
         # Copy HF state dict
