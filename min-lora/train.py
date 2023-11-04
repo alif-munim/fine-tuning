@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import inspect
 
 import numpy as np
 import torch
@@ -28,6 +29,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+
+from lora.model import add_lora
+from lora.utils import tie_weights, get_lora_params, get_lora_state_dict
+
 import tiktoken
 
 out_dir = 'out'
@@ -176,10 +181,46 @@ if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size
     
+if use_lora:
+    add_lora(model, lora_config=lora_config)
+    tie_weights(linear=model.lm_head, embedding=model.transformer.wte)
+    
 
 model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+# optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+
+def configure_optimizers_lora(self, weight_decay, learning_rate, betas, device_type):
+    optim_groups = [
+        {
+            "params": list(get_lora_params(self)),
+            "weight_decay": weight_decay
+        }
+    ]
+    
+    def parameter_count(optim_groups):
+        n = sum(p.numel() for group in optim_groups for p in group["params"])
+        if n < 1e6:
+            return f"{n/1e3:.1f}k"
+        else:
+            return f"{n/1e6:.1f}M"
+        
+    print(f"optimizing {parameter_count(optim_groups)} parameters")
+    
+    use_fused = (device_type == "cuda") and ("fused" in inspect.signature(torch.optim.AdamW).parameters)
+    print(f"using fused AdamW: {use_fused}")
+    extra_args = dict(fused=True) if use_fused else dict()
+    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+    
+    return optimizer
+
+if use_lora:
+    print(f'Using LoRA...')
+    optimizer = configure_optimizers_lora(model, weight_decay, learning_rate, (beta1, beta2), device_type)
+else:
+    print(f'Not using LoRA...')
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    
 
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -263,6 +304,9 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
+                if use_lora:
+                    checkpoint['lora'] = get_lora_state_dict(raw_model)
+                
                 print(f"saving checkpoint to {out_dir}")
                 checkpoint_name = dataset + '_' +  init_from + '_' + 'ckpt.pt'
                 torch.save(checkpoint, os.path.join(out_dir, checkpoint_name))
