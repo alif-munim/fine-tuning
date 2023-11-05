@@ -1,4 +1,4 @@
-from .lora import LoRAParametrization
+from .parametrized_lora import LoRAParametrization
 from torch import nn
 
 
@@ -21,9 +21,10 @@ disable_lora = lambda model: model.apply(apply_to_lora(lambda x: x.disable_lora(
 
 def name_is_lora(name):
     return (
-        len(name.split(".")) >= 4
-        and (name.split(".")[-4]) == "parametrizations"
-        and name.split(".")[-1] in ["lora_A", "lora_B"]
+        # len(name.split(".")) >= 4
+        # and (name.split(".")[-4]) == "parametrizations"
+        # and name.split(".")[-1] in ["lora_A", "lora_B"]
+        "lora" in name
     )
 
 
@@ -34,8 +35,9 @@ def name_is_bias(name):
 def get_params_by_name(model, print_shapes=False, name_filter=None):
     for n, p in model.named_parameters():
         if name_filter is None or name_filter(n):
+            # if p.requires_grad:
             if print_shapes:
-                print(n, p.shape)
+                print(n, p.shape, p.requires_grad)
             yield p
 
 
@@ -61,6 +63,22 @@ def name_is_oft(name):
 
 def get_oft_state_dict(model):
     return {k: v for k, v in model.state_dict().items() if name_is_oft(k)}
+
+
+# ------------------- helper function for inferencing with oft parametrized -----------------------------
+
+def get_poft_params(model, print_shapes=False):
+    return get_params_by_name(model, print_shapes=print_shapes, name_filter=name_is_poft)
+
+def name_is_poft(name):
+    return (
+        len(name.split(".")) >= 4
+        and (name.split(".")[-4]) == "parametrizations"
+        and name.split(".")[-1] in ["R"]
+    )
+
+def get_poft_state_dict(model):
+    return {k: v for k, v in model.state_dict().items() if name_is_poft(k)}
 
 
 # ------------------- helper function for inferencing with multiple lora -------------------
@@ -104,9 +122,20 @@ def tie_weights(linear: nn.Linear, embedding: nn.Embedding):
     embedding.parametrizations.weight[0].lora_A = linear.parametrizations.weight[0].lora_B
     embedding.parametrizations.weight[0].lora_B = linear.parametrizations.weight[0].lora_A
 
-
 def untie_weights(linear: nn.Linear, embedding: nn.Embedding):
     """untie the weights of the linear layer and the embedding layer"""
     embedding.parametrizations.weight.original = nn.Parameter(embedding.weight.original.clone())
     embedding.parametrizations.weight[0].lora_A = nn.Parameter(embedding.parametrizations.weight[0].lora_A.clone())
     embedding.parametrizations.weight[0].lora_B = nn.Parameter(embedding.parametrizations.weight[0].lora_B.clone())
+    
+    
+def tie_oft_weights(linear: nn.Linear, embedding: nn.Embedding):
+    """tie the weights of the linear layer and the embedding layer both with the same lora"""
+    # this line below is optional if the original is already tied
+    embedding.parametrizations.weight.original = linear.parametrizations.weight.original
+    embedding.parametrizations.weight[0].R = linear.parametrizations.weight[0].R
+    
+def untie_oft_weights(linear: nn.Linear, embedding: nn.Embedding):
+    """untie the weights of the linear layer and the embedding layer"""
+    embedding.parametrizations.weight.original = nn.Parameter(embedding.weight.original.clone())
+    embedding.parametrizations.weight[0].R = nn.Parameter(embedding.parametrizations.weight[0].R.clone())

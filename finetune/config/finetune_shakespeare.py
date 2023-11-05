@@ -2,7 +2,8 @@ import time
 from functools import partial
 
 import torch
-from finetuning.lora import LoRAParametrization
+from finetuning.parametrized_lora import LoRAParametrization
+from finetuning.parametrized_oft import OFTParametrization
 
 out_dir = 'out-shakespeare'
 eval_interval = 5
@@ -28,9 +29,13 @@ block_size = 1024
 learning_rate = 3e-5
 decay_lr = False
 
-init_from = 'gpt2-large' # models are gpt2, gpt2-medium, gpt2-large, and gpt2-xl
-use_lora = True
-use_oft = False
+init_from = 'gpt2-xl' # models are gpt2, gpt2-medium, gpt2-large, and gpt2-xl
+use_plora = False
+use_poft = False
+
+use_mlora = False
+use_moft = True
+
 
 if init_from == 'gpt2-xl':
     # decrease grad accum from 32 to save memory
@@ -38,7 +43,7 @@ if init_from == 'gpt2-xl':
     gradient_accumulation_steps = 8
     block_size = 128
 
-if use_lora == True:
+if use_plora == True:
     learning_rate = 1e-3
     lora_dropout_p = 0.0
     rank = 4
@@ -51,11 +56,32 @@ if use_lora == True:
             "weight": partial(LoRAParametrization.from_linear, rank=rank, lora_alpha=lora_alpha)
         },
     }
+
+elif use_poft == True:
     
-if use_oft == True:
+    oft_bias=False
+    oft_r=29 # Pre-trained GPT has a vocab size of 50257
+    oft_eps=1e-3
+    oft_coft=True
+    oft_block_share=False
+    
+    oft_config = {
+    torch.nn.Embedding: {
+        "weight": partial(OFTParametrization.from_embedding, bias=oft_bias, r=oft_r, eps=oft_eps, is_coft=oft_coft, block_share=oft_block_share),
+    },
+    torch.nn.Linear: {
+        "weight": partial(OFTParametrization.from_linear, bias=oft_bias, r=oft_r, eps=oft_eps, is_coft=oft_coft, block_share=oft_block_share),
+    },
+}
+    
+elif use_moft == True:
     compile = False
     oft_modules = ["CausalSelfAttention"]
     oft_r=4
     oft_eps=1e-3
     oft_coft=False
     oft_block_share=False
+    
+elif use_mlora == True:
+    compile = False
+    lora_modules = ["CausalSelfAttention"]

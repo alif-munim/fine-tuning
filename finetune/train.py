@@ -30,20 +30,26 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 
-from finetuning.lora import add_lora
-from finetuning.utils import (
-    tie_weights, 
-    get_lora_params, 
-    get_lora_state_dict, 
-    get_oft_params, 
-    get_oft_state_dict
-)
+from finetuning.parametrized_lora import add_lora
+from finetuning.parametrized_oft import add_oft
 
-from finetuning.oft import (
+from finetuning.modular_oft import (
     inject_trainable_oft, 
     inject_trainable_oft_conv, 
     inject_trainable_oft_extended, 
     inject_trainable_oft_with_norm
+)
+from finetuning.modular_lora import inject_trainable_lora
+
+from finetuning.utils import (
+    get_lora_params, 
+    get_lora_state_dict, 
+    get_oft_params, 
+    get_oft_state_dict,
+    get_poft_params,
+    get_poft_state_dict,
+    tie_weights, 
+    tie_oft_weights
 )
 
 import tiktoken
@@ -91,6 +97,8 @@ compile = True
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) 
 config = {k: globals()[k] for k in config_keys} 
+
+ft_method = "plora" if use_plora else "mlora" if use_mlora else "moft" if use_moft else ""
 
 ddp = int(os.environ.get('RANK', -1)) != -1 
 if ddp:
@@ -194,27 +202,31 @@ if block_size < model.config.block_size:
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size
     
-if use_lora:
+if use_plora:
     add_lora(model, lora_config=lora_config)
     tie_weights(linear=model.lm_head, embedding=model.transformer.wte)
+    
+if use_poft:
+    add_oft(model, oft_config=oft_config)
+    tie_oft_weights(linear=model.lm_head, embedding=model.transformer.wte)
     
 
 model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 def param_count(param_list):
+    
     n = sum(p.numel() for p in param_list)
     if n < 1e6:
         return f"{n/1e3:.1f}k"
     else:
         return f"{n/1e6:.1f}M"
 
-def configure_optimizers_lora(self, weight_decay, learning_rate, betas, device_type):
+def configure_optimizers_ft(self, param_list, weight_decay, learning_rate, betas, device_type):
     
-    lora_param_list = list(get_lora_params(self, print_shapes=False))
     optim_groups = [
         {
-            "params": lora_param_list,
+            "params": param_list,
             "weight_decay": weight_decay
         }
     ]
@@ -230,26 +242,45 @@ def configure_optimizers_lora(self, weight_decay, learning_rate, betas, device_t
 
 
 
-if use_lora:
-    print(f'using LoRA...')
-    optimizer = configure_optimizers_lora(model, weight_decay, learning_rate, (beta1, beta2), device_type)
+if use_plora:
+    print(f'using parametrized lora fine-tuning...')
+    
+    lora_param_list = list(get_lora_params(model, print_shapes=False))
+    optimizer = configure_optimizers_ft(model, lora_param_list, weight_decay, learning_rate, (beta1, beta2), device_type)
     
     print(f'freezing gpt2 model weights...')
     for name, param in model.named_parameters():
-        if use_lora and 'lora' not in name:
+        if 'lora' not in name:
             param.requires_grad = False
-       
-    lora_param_list = list(get_lora_params(model, print_shapes=False))
     print(f"optimizing {param_count(lora_param_list)} parameters")
-
-elif use_oft:
+    
+elif use_poft:
+    print(f'using parametrized oft fine-tuning...')
+    poft_param_list = list(get_poft_params(model, print_shapes=False))
+    optimizer = configure_optimizers_ft(model, poft_param_list, weight_decay, learning_rate, (beta1, beta2), device_type)
+    
+    print(f'freezing gpt2 model weights...')
+    for name, param in model.named_parameters():
+        if 'oft' not in name:
+            param.requires_grad = False
+    print(f"optimizing {param_count(poft_param_list)} parameters")
+    
+elif use_moft:
     model.requires_grad_(False)
-    print(f'using OFT...')
+    print(f'using modular oft fine-tuning...')
     oft_params, train_names = inject_trainable_oft(model, target_replace_module=oft_modules, verbose=False, r=oft_r, eps=oft_eps, is_coft=oft_coft, block_share=oft_block_share)
+    optimizer = configure_optimizers_ft(model, oft_params, weight_decay, learning_rate, (beta1, beta2), device_type)
+    print(f"optimizing {param_count(oft_params)} parameters")
+    
+elif use_mlora:
+    model.requires_grad_(False)
+    print(f'using modular lora fine-tuning...')
+    lora_params, train_names = inject_trainable_lora(model, target_replace_module=lora_modules, r=4, loras=None,verbose = False, dropout_p=0.0, scale=1.0,)
     optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
     
-    oft_param_list = list(get_oft_params(model, print_shapes=False))
-    print(f"optimizing {param_count(oft_param_list)} parameters")
+    lora_param_list = list(get_lora_params(model, print_shapes=False))
+    print(f"optimizing {param_count(lora_param_list)} parameters")
+    
 else:
     print(f'not using LoRA or OFT...')
     optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -335,13 +366,13 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                if use_lora:
+                if use_plora:
                     checkpoint['lora'] = get_lora_state_dict(raw_model)
-                elif use_oft:
+                elif use_poft:
                     checkpoint['oft'] = get_oft_state_dict(raw_model)
                 
                 print(f"saving checkpoint to {out_dir}")
-                checkpoint_name = dataset + '_' +  init_from + '_' + 'ckpt.pt'
+                checkpoint_name = dataset + '_' +  init_from + '_' + ft_method + '_' + 'ckpt.pt'
                 torch.save(checkpoint, os.path.join(out_dir, checkpoint_name))
     if iter_num == 0 and eval_only:
         break
