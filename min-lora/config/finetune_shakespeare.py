@@ -2,8 +2,7 @@ import time
 from functools import partial
 
 import torch
-from lora.model import LoRAParametrization
-
+from finetuning.lora import LoRAParametrization
 
 out_dir = 'out-shakespeare'
 eval_interval = 5
@@ -30,7 +29,8 @@ learning_rate = 3e-5
 decay_lr = False
 
 init_from = 'gpt2-large' # models are gpt2, gpt2-medium, gpt2-large, and gpt2-xl
-use_lora = False
+use_lora = True
+use_oft = False
 
 if init_from == 'gpt2-xl':
     # decrease grad accum from 32 to save memory
@@ -52,4 +52,10 @@ if use_lora == True:
         },
     }
     
-
+if use_oft == True:
+    compile = False
+    oft_modules = ["CausalSelfAttention"]
+    oft_r=4
+    oft_eps=1e-3
+    oft_coft=False
+    oft_block_share=False

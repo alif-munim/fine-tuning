@@ -30,8 +30,21 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 
-from lora.model import add_lora
-from lora.utils import tie_weights, get_lora_params, get_lora_state_dict
+from finetuning.lora import add_lora
+from finetuning.utils import (
+    tie_weights, 
+    get_lora_params, 
+    get_lora_state_dict, 
+    get_oft_params, 
+    get_oft_state_dict
+)
+
+from finetuning.oft import (
+    inject_trainable_oft, 
+    inject_trainable_oft_conv, 
+    inject_trainable_oft_extended, 
+    inject_trainable_oft_with_norm
+)
 
 import tiktoken
 
@@ -188,24 +201,23 @@ if use_lora:
 
 model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-# optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+
+def param_count(param_list):
+    n = sum(p.numel() for p in param_list)
+    if n < 1e6:
+        return f"{n/1e3:.1f}k"
+    else:
+        return f"{n/1e6:.1f}M"
 
 def configure_optimizers_lora(self, weight_decay, learning_rate, betas, device_type):
+    
+    lora_param_list = list(get_lora_params(self, print_shapes=False))
     optim_groups = [
         {
-            "params": list(get_lora_params(self)),
+            "params": lora_param_list,
             "weight_decay": weight_decay
         }
     ]
-    
-    def parameter_count(optim_groups):
-        n = sum(p.numel() for group in optim_groups for p in group["params"])
-        if n < 1e6:
-            return f"{n/1e3:.1f}k"
-        else:
-            return f"{n/1e6:.1f}M"
-        
-    print(f"optimizing {parameter_count(optim_groups)} parameters")
     
     use_fused = (device_type == "cuda") and ("fused" in inspect.signature(torch.optim.AdamW).parameters)
     print(f"using fused AdamW: {use_fused}")
@@ -214,13 +226,36 @@ def configure_optimizers_lora(self, weight_decay, learning_rate, betas, device_t
     
     return optimizer
 
+
+
+
+
 if use_lora:
-    print(f'Using LoRA...')
+    print(f'using LoRA...')
     optimizer = configure_optimizers_lora(model, weight_decay, learning_rate, (beta1, beta2), device_type)
-else:
-    print(f'Not using LoRA...')
+    
+    print(f'freezing gpt2 model weights...')
+    for name, param in model.named_parameters():
+        if use_lora and 'lora' not in name:
+            param.requires_grad = False
+       
+    lora_param_list = list(get_lora_params(model, print_shapes=False))
+    print(f"optimizing {param_count(lora_param_list)} parameters")
+
+elif use_oft:
+    model.requires_grad_(False)
+    print(f'using OFT...')
+    oft_params, train_names = inject_trainable_oft(model, target_replace_module=oft_modules, verbose=False, r=oft_r, eps=oft_eps, is_coft=oft_coft, block_share=oft_block_share)
     optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
     
+    oft_param_list = list(get_oft_params(model, print_shapes=False))
+    print(f"optimizing {param_count(oft_param_list)} parameters")
+else:
+    print(f'not using LoRA or OFT...')
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    
+
+
 
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -280,10 +315,6 @@ while True:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         
-        # sample_generation = model.generate(X, max_new_tokens=100)
-        # decoded_generation = enc.decode(sample_generation[0].tolist())
-        # print(f'\n\nSample Generation: \n{decoded_generation}\n\n')
-        
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -306,6 +337,8 @@ while True:
                 }
                 if use_lora:
                     checkpoint['lora'] = get_lora_state_dict(raw_model)
+                elif use_oft:
+                    checkpoint['oft'] = get_oft_state_dict(raw_model)
                 
                 print(f"saving checkpoint to {out_dir}")
                 checkpoint_name = dataset + '_' +  init_from + '_' + 'ckpt.pt'
