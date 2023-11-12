@@ -5,14 +5,14 @@ import torch
 from finetuning.parametrized_lora import LoRAParametrization
 from finetuning.parametrized_oft import OFTParametrization
 
-out_dir = 'out-shakespeare'
+out_dir = 'out-guanaco'
 eval_interval = 5
 eval_iters = 40
 max_iters = 100
 
 # only save checkpoints if the validation loss improves
 always_save_checkpoint = False
-dataset = 'shakespeare'
+dataset = 'guanaco'
 
 # the number of examples per iter:
 # 1 batch_size * 32 grad_accum * 1024 tokens = 32,768 tokens/iter
@@ -34,7 +34,7 @@ use_moft = False
 
 ft_method = "plora" if use_plora else "mlora" if use_mlora else "moft" if use_moft else ""
 wandb_log = True # feel free to turn on
-wandb_project = 'gpt2-shakespeare'
+wandb_project = 'gpt2-guanaco'
 wandb_run_name = 'ft-' + ft_method + '-' + str(time.time())
 
 
