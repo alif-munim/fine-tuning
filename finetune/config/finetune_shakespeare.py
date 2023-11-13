@@ -30,7 +30,7 @@ use_plora = False
 use_poft = False
 
 use_mlora = False
-use_moft = False
+use_moft = True
 
 ft_method = "plora" if use_plora else "mlora" if use_mlora else "moft" if use_moft else ""
 wandb_log = True # feel free to turn on

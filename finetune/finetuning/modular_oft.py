@@ -570,6 +570,66 @@ def inject_trainable_oft(
     return require_grad_params, names
 
 
+def monkeypatch_remove_oft(model):
+    for _module, name, _child_module in _find_modules(
+        model, search_class=[OFTInjectedLinear]
+    ):
+        if isinstance(_child_module, OFTInjectedLinear):
+            _source = _child_module.OFT
+            weight, bias = _source.weight, _source.bias
+
+            _tmp = nn.Linear(
+                _source.in_features, _source.out_features, bias is not None
+            )
+
+            _tmp.weight = weight
+            if bias is not None:
+                _tmp.bias = bias
+
+        _module._modules[name] = _tmp
+        
+        
+def collapse_oft(model):
+
+    for _module, name, _child_module in _find_modules(
+        model,
+        search_class=[OFTInjectedLinear],
+    ):
+
+        if isinstance(_child_module, OFTInjectedLinear):
+            print("Collapsing Lin OFT in", name)
+            
+            # OFT transformation
+            dtype = _child_module.R.dtype
+
+            if _child_module.block_share:
+                if _child_module.is_coft:
+                    with torch.no_grad():
+                        _child_module.R.copy_(project(_child_module.R, eps=_child_module.eps))
+                orth_rotate = _child_module.cayley(_child_module.R)
+            else:
+                if _child_module.is_coft:
+                    with torch.no_grad():
+                        _child_module.R.copy_(project_batch(_child_module.R, eps=_child_module.eps))
+                orth_rotate = _child_module.cayley_batch(_child_module.R)
+
+            # Block-diagonal parametrization
+            block_diagonal_matrix = _child_module.block_diagonal(orth_rotate)
+
+            # fix filter
+            # print(self.OFT)
+            fix_filt = _child_module.OFT.weight.data
+            fix_filt = torch.transpose(fix_filt, 0, 1)
+            filt = torch.mm(block_diagonal_matrix, fix_filt.to(dtype))
+            filt = torch.transpose(filt, 0, 1)
+            
+            _child_module.OFT.weight = nn.Parameter(
+                filt
+                .type(_child_module.R.dtype)
+                .to(_child_module.OFT.weight.device)
+            )
+
+
 def inject_trainable_oft_with_norm(
     model: nn.Module,
     target_replace_module: Set[str] = DEFAULT_TARGET_REPLACE,
