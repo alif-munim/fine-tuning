@@ -4,4 +4,5 @@ out*
 __pycache__
 *.pyc
 wandb/
+llama-2-7b*
 gpt2-*
