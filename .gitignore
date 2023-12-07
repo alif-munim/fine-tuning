@@ -3,3 +3,6 @@ out*
 *.bin
 __pycache__
 *.pyc
+
+wandb/
+llama-2-7b*
