@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import inspect
 
 import numpy as np
 import torch
@@ -28,6 +29,30 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
+
+from finetuning.parametrized_lora import add_lora
+from finetuning.parametrized_oft import add_oft
+
+from finetuning.modular_oft import (
+    inject_trainable_oft, 
+    inject_trainable_oft_conv, 
+    inject_trainable_oft_extended, 
+    inject_trainable_oft_with_norm
+)
+from finetuning.modular_lora import inject_trainable_lora
+
+from finetuning.utils import (
+    get_lora_params, 
+    get_lora_state_dict, 
+    get_oft_params, 
+    get_oft_state_dict,
+    get_poft_params,
+    get_poft_state_dict,
+    tie_weights, 
+    tie_oft_weights
+)
+
+import tiktoken
 
 out_dir = 'out'
 eval_interval = 2000
@@ -72,6 +97,8 @@ compile = True
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) 
 config = {k: globals()[k] for k in config_keys} 
+
+ft_method = "plora" if use_plora else "mlora" if use_mlora else "moft" if use_moft else ""
 
 ddp = int(os.environ.get('RANK', -1)) != -1 
 if ddp:
@@ -171,13 +198,95 @@ elif init_from == 'resume':
 
         
 if block_size < model.config.block_size:
+    print(f"Cropping initial block size {model.config.block_size} to {block_size}")
     model.crop_block_size(block_size)
     model_args['block_size'] = block_size
+    
+if use_plora:
+    add_lora(model, lora_config=lora_config)
+    tie_weights(linear=model.lm_head, embedding=model.transformer.wte)
+    
+if use_poft:
+    add_oft(model, oft_config=oft_config)
+    tie_oft_weights(linear=model.lm_head, embedding=model.transformer.wte)
     
 
 model.to(device)
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+
+def param_count(param_list):
+    
+    n = sum(p.numel() for p in param_list)
+    if n < 1e6:
+        return f"{n/1e3:.1f}k"
+    else:
+        return f"{n/1e6:.1f}M"
+
+def configure_optimizers_ft(self, param_list, weight_decay, learning_rate, betas, device_type):
+    
+    optim_groups = [
+        {
+            "params": param_list,
+            "weight_decay": weight_decay
+        }
+    ]
+    
+    use_fused = (device_type == "cuda") and ("fused" in inspect.signature(torch.optim.AdamW).parameters)
+    print(f"using fused AdamW: {use_fused}")
+    extra_args = dict(fused=True) if use_fused else dict()
+    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+    
+    return optimizer
+
+
+
+
+
+if use_plora:
+    print(f'using parametrized lora fine-tuning...')
+    
+    lora_param_list = list(get_lora_params(model, print_shapes=False))
+    optimizer = configure_optimizers_ft(model, lora_param_list, weight_decay, learning_rate, (beta1, beta2), device_type)
+    
+    print(f'freezing gpt2 model weights...')
+    for name, param in model.named_parameters():
+        if 'lora' not in name:
+            param.requires_grad = False
+    print(f"optimizing {param_count(lora_param_list)} parameters")
+    
+elif use_poft:
+    print(f'using parametrized oft fine-tuning...')
+    poft_param_list = list(get_poft_params(model, print_shapes=False))
+    optimizer = configure_optimizers_ft(model, poft_param_list, weight_decay, learning_rate, (beta1, beta2), device_type)
+    
+    print(f'freezing gpt2 model weights...')
+    for name, param in model.named_parameters():
+        if 'oft' not in name:
+            param.requires_grad = False
+    print(f"optimizing {param_count(poft_param_list)} parameters")
+    
+elif use_moft:
+    model.requires_grad_(False)
+    print(f'using modular oft fine-tuning...')
+    oft_params, train_names = inject_trainable_oft(model, target_replace_module=oft_modules, verbose=False, r=oft_r, eps=oft_eps, is_coft=oft_coft, block_share=oft_block_share)
+    optimizer = configure_optimizers_ft(model, oft_params, weight_decay, learning_rate, (beta1, beta2), device_type)
+    print(f"optimizing {param_count(oft_params)} parameters")
+    
+elif use_mlora:
+    model.requires_grad_(False)
+    print(f'using modular lora fine-tuning...')
+    lora_params, train_names = inject_trainable_lora(model, target_replace_module=lora_modules, r=4, loras=None,verbose = False, dropout_p=0.0, scale=1.0,)
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    
+    lora_param_list = list(get_lora_params(model, print_shapes=False))
+    print(f"optimizing {param_count(lora_param_list)} parameters")
+    
+else:
+    print(f'not using LoRA or OFT...')
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    
+
+
 
 if compile:
     print("compiling the model... (takes a ~minute)")
@@ -185,6 +294,7 @@ if compile:
     model = torch.compile(model) 
 
 if ddp:
+    print("initializing distributed training (DDP)")
     model = DDP(model, device_ids=[ddp_local_rank])
 
 @torch.no_grad()
@@ -224,6 +334,8 @@ t0 = time.time()
 local_iter_num = 0 
 raw_model = model.module if ddp else model 
 running_mfu = -1.0
+enc = tiktoken.get_encoding("gpt2")
+
 while True:
 
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -233,6 +345,16 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        
+        if wandb_log:
+            wandb.log({
+                "iter": iter_num,
+                "train/loss": losses['train'],
+                "val/loss": losses['val'],
+                "lr": lr,
+                "mfu": running_mfu*100, # convert to percentage
+            })
+        
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -244,8 +366,14 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
+                if use_plora:
+                    checkpoint['lora'] = get_lora_state_dict(raw_model)
+                elif use_poft:
+                    checkpoint['oft'] = get_oft_state_dict(raw_model)
+                
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                checkpoint_name = dataset + '_' +  init_from + '_' + ft_method + '_' + 'ckpt.pt'
+                torch.save(checkpoint, os.path.join(out_dir, checkpoint_name))
     if iter_num == 0 and eval_only:
         break
 

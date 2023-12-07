@@ -6,6 +6,15 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+import os
+import json
+from transformers import WEIGHTS_NAME, CONFIG_NAME
+from transformers.file_utils import PushToHubMixin
+from huggingface_hub import HfApi, create_repo, Repository
+from requests.exceptions import HTTPError
+
+
+
 class LayerNorm(nn.Module):
     
     def __init__(self, ndim, bias):
@@ -25,7 +34,7 @@ class CausalSelfAttention(nn.Module):
     
     def __init__(self, config):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
+        assert config.n_embd % config.n_head == 0, f"Embedding size {config.n_embd} is not divisible by number of heads {config.n_head}"
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         
@@ -109,6 +118,11 @@ class GPTConfig:
     dropout: float = 0.0
     bias: bool = True
     
+    def to_json_string(self):
+        """
+        Serializes this instance to a JSON string.
+        """
+        return json.dumps(self.__dict__, indent=2) + "\n"
 
 class GPT(nn.Module):
     
@@ -119,16 +133,16 @@ class GPT(nn.Module):
         self.config = config
         
         self.transformer = nn.ModuleDict(dict(
-            t_emb = nn.Embedding(config.vocab_size, config.n_embd),
-            p_emb = nn.Embedding(config.block_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
             dropout = nn.Dropout(config.dropout),
-            blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias)
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
         # Weight tying (?)
-        self.transformer.t_emb.weight = self.lm_head.weight
+        self.transformer.wte.weight = self.lm_head.weight
         
         self.apply(self._init_weights)
         
@@ -150,15 +164,15 @@ class GPT(nn.Module):
         
         # The possible positions of a token given the time (t) sequence dim
         pos = torch.arange(0, t, dtype=torch.long, device=device)
-        pos_emb = self.transformer.p_emb(pos)
+        pos_emb = self.transformer.wpe(pos)
         
         # Token embeddings
-        tok_emb = self.transformer.t_emb(idx)
+        tok_emb = self.transformer.wte(idx)
         
         # Add embeddings and pass through all of the transformer blocks
         # Finally, apply layer normalization to output
         x = self.transformer.dropout(tok_emb + pos_emb)
-        for block in self.transformer.blocks:
+        for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
         
@@ -195,7 +209,7 @@ class GPT(nn.Module):
         
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
-            n_params -= self.transformer.p_emb.weight.numel()
+            n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
 
@@ -218,45 +232,64 @@ class GPT(nn.Module):
         return mfu
     
     # TODO: implement loading from pre-trained
-    def from_pretrained(cls, model_type, override_args=None):
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {}
+    @classmethod 
+    def from_pretrained(cls, model_name_or_path, override_args=None):
+        print("model_name_or_path: ", model_name_or_path)
+        override_args = override_args or {} # default to empty dict
         assert all(k == 'dropout' for k in override_args) # Only dropout can be overwritten
         from transformers import GPT2LMHeadModel
-        print(f'Loading weights from pre-trained GPT: {model_type}')
         
-        config_args = {
-            'gpt2': dict(n_layer=12, n_head=12, n_embd=768), # 124M params
-            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024), # 124M params
-            'gpt2-large': dict(n_layer=36, n_head=120, n_embd=1280), # 124M params
-            'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600), # 124M params
-        }[model_type]
+        custom = model_name_or_path in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
         
-        print("Forcing vocab_size=50257, block_size=1024, bias=True (GPT checkpoint pre-reqs)")
-        config_args['vocab_size'] = 50257
-        config_args['block_size'] = 1024
-        config_args['bias'] = True
-        
-        if 'dropout' in override_args:
-            print(f'Overriding dropout rate to {override_args['dropout']}')
-            config_args['dropout'] = override_args['dropout']
-            
+        print(f'Loading weights from pre-trained GPT: {model_name_or_path}')
+        model_hf = GPT2LMHeadModel.from_pretrained(model_name_or_path, resume_download=True)
+
+        if custom:
+            config_args = {
+                'gpt2': dict(n_layer=12, n_head=12, n_embd=768), # 124M params
+                'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024), # 124M params
+                'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280), # 124M params
+                'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600), # 124M params
+            }[model_name_or_path]
+
+            print("Forcing vocab_size=50257, block_size=1024, bias=True (GPT checkpoint pre-reqs)")
+            config_args['vocab_size'] = 50257
+            config_args['block_size'] = 1024
+            config_args['bias'] = True
+
+            if 'dropout' in override_args:
+                print(f"Overriding dropout rate to {override_args['dropout']}")
+                config_args['dropout'] = override_args['dropout']
+        else:
+            # model_hf = GPT2LMHeadModel.from_pretrained(model_name_or_path)
+
+            # Update our GPTConfig with any override arguments provided
+            override_args = override_args or {}
+            config_args = {
+                'vocab_size': model_hf.config.vocab_size,
+                'block_size': model_hf.config.n_positions,
+                'n_layer': model_hf.config.n_layer,
+                'n_head': model_hf.config.n_head,
+                'n_embd': model_hf.config.n_embd,
+                'dropout': model_hf.config.summary_first_dropout,
+                'bias': True
+            }
+            config_args.update(override_args)
+
         config = GPTConfig(**config_args)
         model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
-        
+
         # Discard the .attn.bias mask/buffer (?)
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
-        
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
         sd_hf = model_hf.state_dict()
-        
+
         # Copy HF state dict
         sd_keys_hf = sd_hf.keys()
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
         sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
-        
+
         # OpenAI checkpoints use Conv1D instead of Linear, so weights need to be transposed before import
         transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
         assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf) != {len(sd_keys)}}"
@@ -269,15 +302,90 @@ class GPT(nn.Module):
                 assert sd_hf[k].shape == sd[k].shape
                 with torch.no_grad():
                     sd[k].copy_(sd_hf[k])
+
         return model
     
+    def save_pretrained(self, save_directory):
+        
+        sd = self.state_dict()
+        sd_keys = sd.keys()
+
+        # Discard the .attn.bias mask/buffer (?)
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
+
+        # OpenAI checkpoints use Conv1D instead of Linear, so weights need to be transposed before import
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        for k in sd_keys:
+            if any(k.endswith(w) for w in transposed):
+                with torch.no_grad():
+                    sd[k] = sd[k].t()
+            else:
+                with torch.no_grad():
+                    sd[k] = sd[k]
+                    
+        torch.save(sd, os.path.join(save_directory, WEIGHTS_NAME))
+        
+        # Save the configuration file
+        config_file = os.path.join(save_directory, CONFIG_NAME)
+        with open(config_file, 'w', encoding='utf-8') as f:
+            f.write(self.config.to_json_string())
+        
+    
+#     def save_pretrained(self, save_directory):
+#         """
+#         Save the model weights and configuration file to a directory, so that
+#         it can be re-loaded using the `from_pretrained` class method.
+#         """
+#         os.makedirs(save_directory, exist_ok=True)
+#         # Save the weights
+#         torch.save(self.state_dict(), os.path.join(save_directory, WEIGHTS_NAME))
+
+#         # Save the configuration file
+#         config_file = os.path.join(save_directory, CONFIG_NAME)
+#         with open(config_file, 'w', encoding='utf-8') as f:
+#             f.write(self.config.to_json_string())
+    
+    
+    def push_to_hub(self, repo_name, organization=None, private=False, token=None, commit_message="Add model"):
+        """
+        Push the model to the Hugging Face Hub, creating the repository if it does not exist.
+        """
+        # If an organization is specified, prepend it to the repo_name
+        full_repo_name = f"{organization}/{repo_name}" if organization else repo_name
+
+        try:
+            # Instantiate Hugging Face API instance
+            api = HfApi()
+
+            # Create a repository on the Hugging Face Hub
+            create_repo(full_repo_name, private=private, token=token)
+        
+        except HTTPError as http_err:
+            # If a HTTP error occurs, check if it's because the repo already exists
+            if http_err.response.status_code != 409:
+                raise
+
+        # Construct the repository URL
+        repo_url = f"https://huggingface.co/{full_repo_name}"
+
+        # Clone the repository (or use an existing clone)
+        repo_local_path = full_repo_name.split("/")[-1]
+        repo = Repository(repo_local_path, clone_from=repo_url, use_auth_token=token)
+
+        # Save model and configuration in the cloned repository directory
+        self.save_pretrained(repo_local_path)
+
+        # Push to the hub
+        repo.git_pull()  # Ensure we are up-to-date with remote changes
+        repo.push_to_hub(commit_message=commit_message)
+
     
     #TODO: Crop block size if needed
     def crop_block_size(self, block_size):
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.p_emb.weight = nn.Parameter(self.transformer.p_emb.weight[:block_size])
-        for block in self.transformer.blocks:
+        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
                 block.attn.bias = block.attn.bias[:, :, :block_size, :block_size]
     
