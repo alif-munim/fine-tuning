@@ -13,9 +13,15 @@ from transformers import (
 from peft import LoraConfig, PeftModel
 from trl import SFTTrainer
 
+import os
+from datasets import load_dataset, Dataset
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
+import pandas as pd
+
 model_name = "meta-llama/Llama-2-7b-hf"
 dataset_name = "timdettmers/openassistant-guanaco"
-new_model = "llama-2-7b-guanaco"
+
 
 lora_r = 64
 lora_alpha = 16
@@ -55,7 +61,12 @@ max_seq_length = None
 packing = False
 # device_map = {"": 0}
 
-dataset = load_dataset(dataset_name, split="train")
+dataset_path = "/scratch/alif/timdettmers___json/timdettmers--openassistant-guanaco-c93588435bc90172/0.0.0/fe5dd6ea2639a6df622901539cb550cf8797e5a6b2dd7af1cf934bed8e233e6e/"
+train_path = os.path.join(dataset_path, 'json-train.arrow')
+test_path = os.path.join(dataset_path, 'json-test.arrow')
+
+train_dataset = Dataset.from_file(train_path)
+test_dataset = Dataset.from_file(test_path)
 
 compute_dtype = getattr(torch, bnb_4bit_compute_dtype)
 
@@ -120,33 +131,72 @@ training_arguments = TrainingArguments(
     report_to=None
 )
 
-# Set supervised fine-tuning parameters
-trainer = SFTTrainer(
-    model=model,
-    train_dataset=train_dataset,
-    peft_config=peft_config,
-    dataset_text_field="text",
-    max_seq_length=max_seq_length,
-    tokenizer=tokenizer,
-    args=training_arguments,
-    packing=packing,
-)
 
-# Train model
-trainer.train()
 
-# Save trained model
-trainer.model.save_pretrained(new_model)
+#### CLUSTERING #########
 
-# %load_ext tensorboard
-# %tensorboard --logdir results/runs
 
-# Ignore warnings
-logging.set_verbosity(logging.CRITICAL)
+def cluster_dataset(dataset, num_clusters):    
+    # Extract text data (adjust the key 'text' if your dataset has a different text field)
+    texts = [entry['text'] for entry in dataset]
 
-# Run text generation pipeline with our next model
-prompt = "What is a large language model?"
-pipe = pipeline(task="text-generation", model=model, tokenizer=tokenizer, max_length=200)
-result = pipe(f"<s>[INST] {prompt} [/INST]")
-print(result[0]['generated_text'])
+    # Data Preparation and Feature Extraction
+    vectorizer = TfidfVectorizer(stop_words='english')
+    X = vectorizer.fit_transform(texts)
+
+    # Clustering
+    kmeans = KMeans(n_clusters=num_clusters, random_state=0)
+    kmeans.fit(X)
+
+    # Assigning cluster labels to each text
+    cluster_labels = kmeans.labels_
+
+    # Creating a DataFrame for easier visualization
+    clustered_data = pd.DataFrame({'text': texts, 'cluster': cluster_labels})
+
+    return clustered_data
+
+
+
+num_clusters = 4  # Adjust the number of clusters as needed
+clustered_data = cluster_dataset(train_dataset, num_clusters)
+unique_clusters = clustered_data['cluster'].unique()
+cluster_datasets = {}
+
+# Loop through each cluster
+for cluster_label in unique_clusters:
+
+    cluster_df = clustered_data[clustered_data['cluster'] == cluster_label]
+    cluster_datasets[f"cluster_{cluster_label}"] = Dataset.from_pandas(cluster_df)
+    
+
+for cluster_label, cluster_dataset in cluster_datasets.items()[1:]:
+    print(f'Training cluster {cluster_label}...')
+    
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config=bnb_config
+    )
+
+    # Create a trainer for this cluster
+    trainer = SFTTrainer(
+        model=model,
+        train_dataset=cluster_dataset,
+        peft_config=peft_config,
+        dataset_text_field="text",
+        max_seq_length=max_seq_length,
+        tokenizer=tokenizer,
+        args=training_arguments,
+        packing=packing,
+    )
+
+    # Train the model for this cluster
+    trainer.train()
+
+    # Save the trained model
+    new_model_name = f"llama-2-7b-guanaco-{num_clusters}_{cluster_label}"
+    trainer.model.save_pretrained(new_model_name)
+
+
+
 

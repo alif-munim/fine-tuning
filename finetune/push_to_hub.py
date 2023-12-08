@@ -20,14 +20,11 @@ config_keys = [k for k,v in globals().items() if not k.startswith('_') and isins
 exec(open('configurator.py').read()) 
 config = {k: globals()[k] for k in config_keys}
 
-# base_model = 'gpt2' # init-from
-# ft_method = 'lora' if use_lora else 'oft' if use_oft else '' # ft_method
-# ft_modules = ["CausalSelfAttention"]
-dataset = 'shakespeare'
 
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) 
 
+dataset = 'guanaco'
 modular_ft = "" if ft_method == "" else ft_method[1:]
 out_dir = f"out-{dataset}"
 ckpt_name = f"{dataset}_{init_from}_{ft_method}_ckpt.pt"
@@ -77,9 +74,13 @@ elif use_moft or use_poft:
 
 print(f"pushing model to huggingface hub")
 # model.save_pretrained(out_dir)
-hf_repo = f"{init_from}-{modular_ft}-{dataset}"
+
+if modular_ft == '':
+    hf_repo = f"{init_from}-{dataset}"
+else:
+    hf_repo = f"{init_from}-{modular_ft}-{dataset}"
 model.push_to_hub(organization="alif-munim", repo_name=hf_repo)
 
 print(f"testing model loading")
 model.from_pretrained(f"alif-munim/{hf_repo}")
-print(f"successfully loaded model from alif-munim/{hf-repo}")
+print(f"successfully loaded model from alif-munim/{hf_repo}")

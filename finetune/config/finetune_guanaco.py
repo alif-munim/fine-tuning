@@ -25,12 +25,12 @@ block_size = 1024
 learning_rate = 3e-5
 decay_lr = False
 
-init_from = 'gpt2' # models are gpt2, gpt2-medium, gpt2-large, and gpt2-xl
+init_from = 'gpt2-large' # models are gpt2, gpt2-medium, gpt2-large, and gpt2-xl
 use_plora = False
 use_poft = False
 
 use_mlora = False
-use_moft = False
+use_moft = True
 
 ft_method = "plora" if use_plora else "mlora" if use_mlora else "moft" if use_moft else ""
 wandb_log = True # feel free to turn on

@@ -1,0 +1,86 @@
+BASELINE
+
+hf (pretrained=alif-munim/llama-2-7b-guanaco), gen_kwargs: (), limit: None, num_fewshot: None, batch_size: 16
+|                 Tasks                 |Version|Filter|n-shot|Metric|Value |   |Stderr|
+|---------------------------------------|-------|------|-----:|------|-----:|---|-----:|
+|mmlu                                   |N/A    |none  |     0|acc   |0.3903|±  |0.0864|
+| - humanities                          |N/A    |none  |     0|acc   |0.3800|±  |0.0910|
+|  - formal_logic                       |Yaml   |none  |     0|acc   |0.2857|±  |0.0404|
+|  - high_school_european_history       |Yaml   |none  |     0|acc   |0.5879|±  |0.0384|
+|  - high_school_us_history             |Yaml   |none  |     0|acc   |0.5000|±  |0.0351|
+|  - high_school_world_history          |Yaml   |none  |     0|acc   |0.5443|±  |0.0324|
+|  - international_law                  |Yaml   |none  |     0|acc   |0.5620|±  |0.0453|
+|  - jurisprudence                      |Yaml   |none  |     0|acc   |0.4815|±  |0.0483|
+|  - logical_fallacies                  |Yaml   |none  |     0|acc   |0.4724|±  |0.0392|
+|  - moral_disputes                     |Yaml   |none  |     0|acc   |0.3960|±  |0.0263|
+|  - moral_scenarios                    |Yaml   |none  |     0|acc   |0.2391|±  |0.0143|
+|  - philosophy                         |Yaml   |none  |     0|acc   |0.4791|±  |0.0284|
+|  - prehistory                         |Yaml   |none  |     0|acc   |0.4012|±  |0.0273|
+|  - professional_law                   |Yaml   |none  |     0|acc   |0.3299|±  |0.0120|
+|  - world_religions                    |Yaml   |none  |     0|acc   |0.5322|±  |0.0383|
+| - other                               |N/A    |none  |     0|acc   |0.4358|±  |0.0649|
+|  - business_ethics                    |Yaml   |none  |     0|acc   |0.4700|±  |0.0502|
+|  - clinical_knowledge                 |Yaml   |none  |     0|acc   |0.3774|±  |0.0298|
+|  - college_medicine                   |Yaml   |none  |     0|acc   |0.3353|±  |0.0360|
+|  - global_facts                       |Yaml   |none  |     0|acc   |0.2800|±  |0.0451|
+|  - human_aging                        |Yaml   |none  |     0|acc   |0.4529|±  |0.0334|
+|  - management                         |Yaml   |none  |     0|acc   |0.3786|±  |0.0480|
+|  - marketing                          |Yaml   |none  |     0|acc   |0.5641|±  |0.0325|
+|  - medical_genetics                   |Yaml   |none  |     0|acc   |0.4200|±  |0.0496|
+|  - miscellaneous                      |Yaml   |none  |     0|acc   |0.5045|±  |0.0179|
+|  - nutrition                          |Yaml   |none  |     0|acc   |0.4510|±  |0.0285|
+|  - professional_accounting            |Yaml   |none  |     0|acc   |0.3475|±  |0.0284|
+|  - professional_medicine              |Yaml   |none  |     0|acc   |0.4044|±  |0.0298|
+|  - virology                           |Yaml   |none  |     0|acc   |0.3976|±  |0.0381|
+| - social_sciences                     |N/A    |none  |     0|acc   |0.4381|±  |0.0772|
+|  - econometrics                       |Yaml   |none  |     0|acc   |0.2456|±  |0.0405|
+|  - high_school_geography              |Yaml   |none  |     0|acc   |0.3788|±  |0.0346|
+|  - high_school_government_and_politics|Yaml   |none  |     0|acc   |0.5026|±  |0.0361|
+|  - high_school_macroeconomics         |Yaml   |none  |     0|acc   |0.3795|±  |0.0246|
+|  - high_school_microeconomics         |Yaml   |none  |     0|acc   |0.3445|±  |0.0309|
+|  - high_school_psychology             |Yaml   |none  |     0|acc   |0.4752|±  |0.0214|
+|  - human_sexuality                    |Yaml   |none  |     0|acc   |0.5267|±  |0.0438|
+|  - professional_psychology            |Yaml   |none  |     0|acc   |0.3954|±  |0.0198|
+|  - public_relations                   |Yaml   |none  |     0|acc   |0.4364|±  |0.0475|
+|  - security_studies                   |Yaml   |none  |     0|acc   |0.4408|±  |0.0318|
+|  - sociology                          |Yaml   |none  |     0|acc   |0.6517|±  |0.0337|
+|  - us_foreign_policy                  |Yaml   |none  |     0|acc   |0.6100|±  |0.0490|
+| - stem                                |N/A    |none  |     0|acc   |0.3143|±  |0.0731|
+|  - abstract_algebra                   |Yaml   |none  |     0|acc   |0.2900|±  |0.0456|
+|  - anatomy                            |Yaml   |none  |     0|acc   |0.3556|±  |0.0414|
+|  - astronomy                          |Yaml   |none  |     0|acc   |0.3750|±  |0.0394|
+|  - college_biology                    |Yaml   |none  |     0|acc   |0.4167|±  |0.0412|
+|  - college_chemistry                  |Yaml   |none  |     0|acc   |0.2800|±  |0.0451|
+|  - college_computer_science           |Yaml   |none  |     0|acc   |0.3000|±  |0.0461|
+|  - college_mathematics                |Yaml   |none  |     0|acc   |0.3200|±  |0.0469|
+|  - college_physics                    |Yaml   |none  |     0|acc   |0.2451|±  |0.0428|
+|  - computer_security                  |Yaml   |none  |     0|acc   |0.4600|±  |0.0501|
+|  - conceptual_physics                 |Yaml   |none  |     0|acc   |0.3787|±  |0.0317|
+|  - electrical_engineering             |Yaml   |none  |     0|acc   |0.3448|±  |0.0396|
+|  - elementary_mathematics             |Yaml   |none  |     0|acc   |0.2196|±  |0.0213|
+|  - high_school_biology                |Yaml   |none  |     0|acc   |0.4226|±  |0.0281|
+|  - high_school_chemistry              |Yaml   |none  |     0|acc   |0.2759|±  |0.0314|
+|  - high_school_computer_science       |Yaml   |none  |     0|acc   |0.3800|±  |0.0488|
+|  - high_school_mathematics            |Yaml   |none  |     0|acc   |0.2556|±  |0.0266|
+|  - high_school_physics                |Yaml   |none  |     0|acc   |0.1854|±  |0.0317|
+|  - high_school_statistics             |Yaml   |none  |     0|acc   |0.2361|±  |0.0290|
+|  - machine_learning                   |Yaml   |none  |     0|acc   |0.3661|±  |0.0457|
+
+|      Groups      |Version|Filter|n-shot|Metric|Value |   |Stderr|
+|------------------|-------|------|-----:|------|-----:|---|-----:|
+|mmlu              |N/A    |none  |     0|acc   |0.3903|±  |0.0864|
+| - humanities     |N/A    |none  |     0|acc   |0.3800|±  |0.0910|
+| - other          |N/A    |none  |     0|acc   |0.4358|±  |0.0649|
+| - social_sciences|N/A    |none  |     0|acc   |0.4381|±  |0.0772|
+| - stem           |N/A    |none  |     0|acc   |0.3143|±  |0.0731|
+
+
+2 ADAPTER
+
+|      Groups      |Version|Filter|n-shot|Metric|Value |   |Stderr|
+|------------------|-------|------|-----:|------|-----:|---|-----:|
+|mmlu              |N/A    |none  |     0|acc   |0.4091|±  |0.0915|
+| - humanities     |N/A    |none  |     0|acc   |0.3860|±  |0.1003|
+| - other          |N/A    |none  |     0|acc   |0.4625|±  |0.0652|
+| - social_sciences|N/A    |none  |     0|acc   |0.4654|±  |0.0817|
+| - stem           |N/A    |none  |     0|acc   |0.3362|±  |0.0732|
