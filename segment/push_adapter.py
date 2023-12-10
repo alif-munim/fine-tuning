@@ -14,7 +14,7 @@ from peft import LoraConfig, PeftModel
 from trl import SFTTrainer
 
 model_name = "meta-llama/Llama-2-7b-hf"
-adapter_model = "llama-2-7b-guanaco-4_avg_adapter"
+adapter_model = "llama-2-7b-guanaco-12_avg_adapter"
 
 # Reload model in FP16 and merge it with LoRA weights
 base_model = AutoModelForCausalLM.from_pretrained(

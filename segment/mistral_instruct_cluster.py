@@ -19,33 +19,29 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 import pandas as pd
 
-model_name = "meta-llama/Llama-2-7b-hf"
-dataset_name = "timdettmers/openassistant-guanaco"
-
+model_name = "mistralai/Mistral-7B-v0.1"
+dataset_name = "monology/VMware-open-instruct-higgsfield"
 
 lora_r = 64
 lora_alpha = 16
 lora_dropout = 0.1
-
 
 use_4bit = True
 bnb_4bit_compute_dtype = "float16"
 bnb_4bit_quant_type = "nf4"
 use_nested_quant = False
 
-
 output_dir = "./results"
 num_train_epochs = 1
 fp16 = True
 bf16 = False
-per_device_train_batch_size = 1
-per_device_eval_batch_size = 1
-gradient_accumulation_steps = 1
+per_device_train_batch_size = 8
+per_device_eval_batch_size = 8
+gradient_accumulation_steps = 4
 gradient_checkpointing = True
 max_grad_norm = 0.3
 learning_rate = 2e-4
 weight_decay = 0.001
-
 
 optim = "paged_adamw_32bit"
 lr_scheduler_type = "cosine"
@@ -55,18 +51,13 @@ group_by_length = True
 
 save_steps = 0
 logging_steps = 25
-
-
-max_seq_length = None
+max_seq_length = 512  # Adjust as needed
 packing = False
-# device_map = {"": 0}
 
-dataset_path = "/scratch/alif/timdettmers___json/timdettmers--openassistant-guanaco-c93588435bc90172/0.0.0/fe5dd6ea2639a6df622901539cb550cf8797e5a6b2dd7af1cf934bed8e233e6e/"
-train_path = os.path.join(dataset_path, 'json-train.arrow')
-test_path = os.path.join(dataset_path, 'json-test.arrow')
-
+# Load dataset from local path
+dataset_path = "/scratch/alif/monology___v_mware-open-instruct-higgsfield/default/0.0.0/622a7cf65a222fcb"
+train_path = os.path.join(dataset_path, 'v_mware-open-instruct-higgsfield-train.arrow')
 train_dataset = Dataset.from_file(train_path)
-test_dataset = Dataset.from_file(test_path)
 
 compute_dtype = getattr(torch, bnb_4bit_compute_dtype)
 
@@ -115,6 +106,7 @@ training_arguments = TrainingArguments(
     output_dir=output_dir,
     num_train_epochs=num_train_epochs,
     per_device_train_batch_size=per_device_train_batch_size,
+    per_device_eval_batch_size=per_device_eval_batch_size,
     gradient_accumulation_steps=gradient_accumulation_steps,
     optim=optim,
     save_steps=save_steps,
@@ -132,53 +124,44 @@ training_arguments = TrainingArguments(
 )
 
 
-
-#### CLUSTERING #########
-
-
+# Clustering function
 def cluster_dataset(dataset, num_clusters):    
-    # Extract text data (adjust the key 'text' if your dataset has a different text field)
-    texts = [entry['text'] for entry in dataset]
-
-    # Data Preparation and Feature Extraction
+    texts = [entry['prompt'] + " " + entry['completion'] for entry in dataset]
     vectorizer = TfidfVectorizer(stop_words='english')
     X = vectorizer.fit_transform(texts)
-
-    # Clustering
     kmeans = KMeans(n_clusters=num_clusters, random_state=0)
     kmeans.fit(X)
-
-    # Assigning cluster labels to each text
     cluster_labels = kmeans.labels_
+    return pd.DataFrame({'prompt': [entry['prompt'] for entry in dataset],
+                         'completion': [entry['completion'] for entry in dataset],
+                         'cluster': cluster_labels})
 
-    # Creating a DataFrame for easier visualization
-    clustered_data = pd.DataFrame({'text': texts, 'cluster': cluster_labels})
+# Preprocess function
+def preprocess_function(examples):
+    # Concatenate 'prompt' and 'completion' fields
+    texts = [prompt + " " + completion for prompt, completion in zip(examples['prompt'], examples['completion'])]
+    return {'text': texts}
 
-    return clustered_data
 
-
-
-num_clusters = 12  # Adjust the number of clusters as needed
+# Cluster the dataset
+num_clusters = 2  # Adjust the number of clusters as needed
 clustered_data = cluster_dataset(train_dataset, num_clusters)
-unique_clusters = clustered_data['cluster'].unique()
+
 cluster_datasets = {}
-
-# Loop through each cluster
-for cluster_label in unique_clusters:
-
+for cluster_label in clustered_data['cluster'].unique():
     cluster_df = clustered_data[clustered_data['cluster'] == cluster_label]
-    cluster_datasets[f"cluster_{cluster_label}"] = Dataset.from_pandas(cluster_df)
-    
+    # Convert the DataFrame to a Hugging Face dataset
+    hf_dataset = Dataset.from_pandas(cluster_df)
+    # Apply preprocessing to concatenate 'prompt' and 'completion' into 'text'
+    hf_dataset = hf_dataset.map(preprocess_function, batched=True)
+    cluster_datasets[f"cluster_{cluster_label}"] = hf_dataset
 
+
+# Tokenize and train models for each cluster
 for cluster_label, cluster_dataset in cluster_datasets.items():
+    tokenized_dataset = cluster_dataset.map(preprocess_function, batched=True)
     print(f'Training cluster {cluster_label}...')
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        quantization_config=bnb_config
-    )
 
-    # Create a trainer for this cluster
     trainer = SFTTrainer(
         model=model,
         train_dataset=cluster_dataset,
@@ -190,13 +173,8 @@ for cluster_label, cluster_dataset in cluster_datasets.items():
         packing=packing,
     )
 
-    # Train the model for this cluster
     trainer.train()
 
-    # Save the trained model
-    new_model_name = f"llama-2-7b-guanaco-{num_clusters}_{cluster_label}"
-    trainer.model.save_pretrained(new_model_name)
-
-
-
-
+    new_model_name = f"mistral-7b-instruct-{num_clusters}_cluster{cluster_label}"
+    model.save_pretrained(new_model_name)
+    tokenizer.save_pretrained(new_model_name)
