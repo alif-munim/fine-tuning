@@ -21,6 +21,15 @@ import pandas as pd
 
 model_name = "mistralai/Mistral-7B-v0.1"
 dataset_name = "monology/VMware-open-instruct-higgsfield"
+cluster = "narval"
+
+# Load dataset from local path
+if cluster == "narval":
+    dataset_path = "/scratch/alif/monology___v_mware-open-instruct-higgsfield/default/0.0.0/622a7cf65a222fcb"
+    train_path = os.path.join(dataset_path, 'v_mware-open-instruct-higgsfield-train.arrow')
+    train_dataset = Dataset.from_file(train_path)
+elif cluster == "cedar":
+    train_dataset = load_dataset(dataset_name, split="train")
 
 lora_r = 64
 lora_alpha = 16
@@ -54,10 +63,7 @@ logging_steps = 25
 max_seq_length = 512  # Adjust as needed
 packing = False
 
-# Load dataset from local path
-dataset_path = "/scratch/alif/monology___v_mware-open-instruct-higgsfield/default/0.0.0/622a7cf65a222fcb"
-train_path = os.path.join(dataset_path, 'v_mware-open-instruct-higgsfield-train.arrow')
-train_dataset = Dataset.from_file(train_path)
+
 
 compute_dtype = getattr(torch, bnb_4bit_compute_dtype)
 
@@ -78,6 +84,15 @@ if compute_dtype == torch.float16 and use_4bit:
         fp16 = False
         bf16 = True
 
+# Load base model
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    quantization_config=bnb_config,
+    # device_map=device_map
+)
+model.config.use_cache = False
+model.config.pretraining_tp = 1
+
 # Load LLaMA tokenizer
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 tokenizer.pad_token = tokenizer.eos_token
@@ -91,6 +106,14 @@ peft_config = LoraConfig(
     bias="none",
     task_type="CAUSAL_LM",
 )
+
+# Preprocess function
+def preprocess_function(examples):
+    # Concatenate 'prompt' and 'completion' fields
+    texts = [prompt + " " + completion for prompt, completion in zip(examples['prompt'], examples['completion'])]
+    return {'text': texts}
+
+hf_dataset = train_dataset.map(preprocess_function, batched=True)
 
 # Set training parameters
 training_arguments = TrainingArguments(
@@ -115,61 +138,21 @@ training_arguments = TrainingArguments(
 )
 
 
-# Clustering function
-def cluster_dataset(dataset, num_clusters):    
-    texts = [entry['prompt'] + " " + entry['completion'] for entry in dataset]
-    vectorizer = TfidfVectorizer(stop_words='english')
-    X = vectorizer.fit_transform(texts)
-    kmeans = KMeans(n_clusters=num_clusters, random_state=0)
-    kmeans.fit(X)
-    cluster_labels = kmeans.labels_
-    return pd.DataFrame({'prompt': [entry['prompt'] for entry in dataset],
-                         'completion': [entry['completion'] for entry in dataset],
-                         'cluster': cluster_labels})
 
-# Preprocess function
-def preprocess_function(examples):
-    # Concatenate 'prompt' and 'completion' fields
-    texts = [prompt + " " + completion for prompt, completion in zip(examples['prompt'], examples['completion'])]
-    return {'text': texts}
+print(f'Training single LoRA...')
 
+trainer = SFTTrainer(
+    model=model,
+    train_dataset=hf_dataset,
+    peft_config=peft_config,
+    dataset_text_field="text",
+    max_seq_length=max_seq_length,
+    tokenizer=tokenizer,
+    args=training_arguments,
+    packing=packing,
+)
 
-# Cluster the dataset
-num_clusters = 8  # Adjust the number of clusters as needed
-clustered_data = cluster_dataset(train_dataset, num_clusters)
+trainer.train()
 
-cluster_datasets = {}
-for cluster_label in clustered_data['cluster'].unique():
-    cluster_df = clustered_data[clustered_data['cluster'] == cluster_label]
-    # Convert the DataFrame to a Hugging Face dataset
-    hf_dataset = Dataset.from_pandas(cluster_df)
-    # Apply preprocessing to concatenate 'prompt' and 'completion' into 'text'
-    hf_dataset = hf_dataset.map(preprocess_function, batched=True)
-    cluster_datasets[f"cluster_{cluster_label}"] = hf_dataset
-
-
-# Tokenize and train models for each cluster
-for cluster_label, cluster_dataset in cluster_datasets.items():
-    print(f'Training cluster {cluster_label}...')
-    
-    # Load base model
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        quantization_config=bnb_config
-    )
-
-    trainer = SFTTrainer(
-        model=model,
-        train_dataset=cluster_dataset,
-        peft_config=peft_config,
-        dataset_text_field="text",
-        max_seq_length=max_seq_length,
-        tokenizer=tokenizer,
-        args=training_arguments,
-        packing=packing,
-    )
-
-    trainer.train()
-
-    new_model_name = f"mistral-7b-instruct-{num_clusters}_cluster{cluster_label}"
-    trainer.model.save_pretrained(new_model_name)
+new_model_name = f"mistral-7b-instruct-qlora"
+trainer.model.save_pretrained(new_model_name)

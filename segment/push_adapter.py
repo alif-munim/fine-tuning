@@ -20,6 +20,7 @@ model_name = "mistralai/Mistral-7B-v0.1"
 adapter_model = "mistral-7b-instruct-4_avg_adapter"
 new_model = "mistral-7b-instruct-8_avg"
 
+
 # Reload model in FP16 and merge it with LoRA weights
 base_model = AutoModelForCausalLM.from_pretrained(
     model_name,
