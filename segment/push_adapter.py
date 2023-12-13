@@ -17,8 +17,8 @@ from trl import SFTTrainer
 # adapter_model = "llama-2-7b-guanaco-12_avg_adapter"
 
 model_name = "mistralai/Mistral-7B-v0.1"
-adapter_model = "mistral-7b-instruct-4_avg_adapter"
-new_model = "mistral-7b-instruct-8_avg"
+adapter_model = "mistral-7b-instruct-qlora"
+new_model = "mistral-7b-instruct-qlora-v2"
 
 
 # Reload model in FP16 and merge it with LoRA weights
@@ -40,5 +40,5 @@ tokenizer.padding_side = "right"
 model.save_pretrained(new_model, use_temp_dir=False)
 tokenizer.save_pretrained(new_model, use_temp_dir=False)
 
-model.push_to_hub(new_model, use_temp_dir=False)
-tokenizer.push_to_hub(new_model, use_temp_dir=False)
+# model.push_to_hub(new_model, use_temp_dir=False)
+# tokenizer.push_to_hub(new_model, use_temp_dir=False)

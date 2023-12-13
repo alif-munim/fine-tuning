@@ -1,0 +1,19 @@
+hf (pretrained=/scratch/alif/language-models/segment/mistral-7b-instruct-qlora-v2), gen_kwargs: (), limit: None, num_fewshot: 5, batch_size: 16
+|  Tasks   |Version|Filter|n-shot|Metric|Value|   |Stderr|
+|----------|-------|------|-----:|------|----:|---|-----:|
+|winogrande|Yaml   |none  |     5|acc   |0.708|±  |0.0128|
+
+hf (pretrained=/scratch/alif/language-models/segment/mistral-7b-instruct-2_avg), gen_kwargs: (), limit: None, num_fewshot: 5, batch_size: 16
+|  Tasks   |Version|Filter|n-shot|Metric|Value |   |Stderr|
+|----------|-------|------|-----:|------|-----:|---|-----:|
+|winogrande|Yaml   |none  |     5|acc   |0.7395|±  |0.0123|
+
+hf (pretrained=/scratch/alif/language-models/segment/mistral-7b-instruct-4_avg), gen_kwargs: (), limit: None, num_fewshot: 5, batch_size: 16
+|  Tasks   |Version|Filter|n-shot|Metric|Value |   |Stderr|
+|----------|-------|------|-----:|------|-----:|---|-----:|
+|winogrande|Yaml   |none  |     5|acc   |0.7395|±  |0.0123|
+
+hf (pretrained=/scratch/alif/language-models/segment/mistral-7b-instruct-8_avg), gen_kwargs: (), limit: None, num_fewshot: 5, batch_size: 16
+|  Tasks   |Version|Filter|n-shot|Metric|Value |   |Stderr|
+|----------|-------|------|-----:|------|-----:|---|-----:|
+|winogrande|Yaml   |none  |     5|acc   |0.7395|±  |0.0123|
