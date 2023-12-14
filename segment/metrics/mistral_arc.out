@@ -1,0 +1,33 @@
+BASE
+
+hf (pretrained=/scratch/alif/language-models/segment/mistral-7b-instruct-qlora-v2), gen_kwargs: (), limit: None, num_fewshot: 25, batch_size: 16
+|    Tasks    |Version|Filter|n-shot| Metric |Value |   |Stderr|
+|-------------|-------|------|-----:|--------|-----:|---|-----:|
+|arc_challenge|Yaml   |none  |    25|acc     |0.3882|±  |0.0142|
+|             |       |none  |    25|acc_norm|0.4266|±  |0.0145|
+|arc_easy     |Yaml   |none  |    25|acc     |0.7062|±  |0.0093|
+|             |       |none  |    25|acc_norm|0.7218|±  |0.0092|
+
+hf (pretrained=/scratch/alif/language-models/segment/mistral-7b-instruct-2_avg), gen_kwargs: (), limit: None, num_fewshot: 25, batch_size: 16
+|    Tasks    |Version|Filter|n-shot| Metric |Value |   |Stderr|
+|-------------|-------|------|-----:|--------|-----:|---|-----:|
+|arc_challenge|Yaml   |none  |    25|acc     |0.5657|±  |0.0145|
+|             |       |none  |    25|acc_norm|0.6084|±  |0.0143|
+|arc_easy     |Yaml   |none  |    25|acc     |0.8434|±  |0.0075|
+|             |       |none  |    25|acc_norm|0.8590|±  |0.0071|
+
+hf (pretrained=/scratch/alif/language-models/segment/mistral-7b-instruct-4_avg), gen_kwargs: (), limit: None, num_fewshot: 25, batch_size: 16
+|    Tasks    |Version|Filter|n-shot| Metric |Value |   |Stderr|
+|-------------|-------|------|-----:|--------|-----:|---|-----:|
+|arc_challenge|Yaml   |none  |    25|acc     |0.7545|±  |0.0072|
+|             |       |none  |    25|acc_norm|0.7790|±  |0.0070|
+|arc_easy     |Yaml   |none  |    25|acc     |0.7547|±  |0.0051|
+|             |       |none  |    25|acc_norm|0.7768|±  |0.0049|
+
+hf (pretrained=/scratch/alif/language-models/segment/mistral-7b-instruct-8_avg), gen_kwargs: (), limit: None, num_fewshot: 25, batch_size: 16
+|    Tasks    |Version|Filter|n-shot| Metric |Value |   |Stderr|
+|-------------|-------|------|-----:|--------|-----:|---|-----:|
+|arc_challenge|Yaml   |none  |    25|acc     |0.5657|±  |0.0145|
+|             |       |none  |    25|acc_norm|0.6084|±  |0.0143|
+|arc_easy     |Yaml   |none  |    25|acc     |0.8434|±  |0.0075|
+|             |       |none  |    25|acc_norm|0.8590|±  |0.0071|
