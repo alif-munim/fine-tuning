@@ -9,3 +9,4 @@ gpt2-*
 mistral-7b-*
 results/
 misc/
+lm_cache/

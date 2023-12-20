@@ -130,6 +130,24 @@ else:
         target_modules=target_modules # Applying LoRA to all linear layers
     )
 
+# Print trainable parameters for this PEFT config
+def print_trainable_parameters(model):
+    """
+    Prints the number of trainable parameters in the model.
+    """
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(
+        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
+    )
+
+peft_model = get_peft_model(model, peft_config)
+print_trainable_parameters(peft_model)
+
 # Set training parameters
 training_arguments = TrainingArguments(
     output_dir=output_dir,

@@ -21,6 +21,9 @@ import pandas as pd
 
 model_name = "mistralai/Mistral-7B-v0.1"
 dataset_name = "monology/VMware-open-instruct-higgsfield"
+
+attention_only = False
+layer_config = "attention" if attention_only else "all"
 cluster = "narval"
 
 # Load dataset from local path
@@ -93,14 +96,52 @@ tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right" # Fix weird overflow issue with fp16 training
 
-# Load LoRA configuration
-peft_config = LoraConfig(
-    lora_alpha=lora_alpha,
-    lora_dropout=lora_dropout,
-    r=lora_r,
-    bias="none",
-    task_type="CAUSAL_LM",
-)
+# By default, LoRA is only applied to attention layers
+# https://github.com/huggingface/peft/blob/main/src/peft/utils/constants.py#L49
+# The QLoRA paper suggests that LoRA should be applied to all linear layers
+# https://github.com/huggingface/peft/issues/735
+if attention_only:
+    print(f'Configuring LoRA to be applied to attention layers...')
+    # Load LoRA configuration
+    peft_config = LoraConfig(
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        r=lora_r,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+else:
+    print(f'Configuring LoRA to be applied to all transformer linear layers...')
+    target_modules = [name for name, layer in model.named_modules() if isinstance(layer, nn.Linear)]
+
+    # Load LoRA configuration
+    peft_config = LoraConfig(
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        r=lora_r,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=target_modules # Applying LoRA to all linear layers
+    )
+
+# Print trainable parameters for this PEFT config
+def print_trainable_parameters(model):
+    """
+    Prints the number of trainable parameters in the model.
+    """
+    trainable_params = 0
+    all_param = 0
+    for _, param in model.named_parameters():
+        all_param += param.numel()
+        if param.requires_grad:
+            trainable_params += param.numel()
+    print(
+        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
+    )
+
+peft_model = get_peft_model(model, peft_config)
+print_trainable_parameters(peft_model)
+
 
 # Preprocess function
 def preprocess_function(examples):
@@ -147,5 +188,5 @@ trainer = SFTTrainer(
 
 trainer.train()
 
-new_model_name = f"mistral-7b-instruct-qlora"
-trainer.model.save_pretrained(new_model_name)
+new_model = f"mistral-7b-instruct-lora-{layer_config}_r{lora_r}_a{lora_alpha}"
+trainer.model.save_pretrained(new_model)
