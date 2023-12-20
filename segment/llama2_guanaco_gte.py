@@ -22,8 +22,13 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.cluster import KMeans
 import pandas as pd
 import numpy as np
+from itertools import islice
 
-num_clusters = 2  # Adjust the number of clusters as needed
+num_clusters = 4  # Adjust the number of clusters as needed
+resume_from = 0
+attention_only = True
+layer_config = "attention" if attention_only else "all"
+
 model_name = "meta-llama/Llama-2-7b-hf"
 # dataset_name = "timdettmers/openassistant-guanaco"
 
@@ -111,18 +116,30 @@ tokenizer.padding_side = "right" # Fix weird overflow issue with fp16 training
 # https://github.com/huggingface/peft/blob/main/src/peft/utils/constants.py#L49
 # The QLoRA paper suggests that LoRA should be applied to all linear layers
 # https://github.com/huggingface/peft/issues/735
-target_modules = [name for name, layer in model.named_modules() if isinstance(layer, nn.Linear)]
 
-# Load LoRA configuration
-peft_config = LoraConfig(
-    lora_alpha=lora_alpha,
-    lora_dropout=lora_dropout,
-    r=lora_r,
-    bias="none",
-    task_type="CAUSAL_LM",
-    target_modules=target_modules # Applying LoRA to all linear layers
-)
+if attention_only:
+    print(f'Configuring LoRA to be applied to attention layers...')
+    # Load LoRA configuration
+    peft_config = LoraConfig(
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        r=lora_r,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+else:
+    print(f'Configuring LoRA to be applied to all transformer linear layers...')
+    target_modules = [name for name, layer in model.named_modules() if isinstance(layer, nn.Linear)]
 
+    # Load LoRA configuration
+    peft_config = LoraConfig(
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        r=lora_r,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=target_modules # Applying LoRA to all linear layers
+    )
 
 #### CLUSTERING #########
 
@@ -161,7 +178,8 @@ for cluster_label in unique_clusters:
 count = 1
 total = len(cluster_datasets.items())
 
-for cluster_label, cluster_dataset in cluster_datasets.items():
+for cluster_label, cluster_dataset in islice(cluster_datasets.items(), resume_from, total, 1):
+    
     
     # The QLoRA paper uses a batch size of 16 for a total of 1875 steps for Guanaco (~10K)
     # Which means the model sees 30K examples, or each example 3 times
@@ -169,7 +187,7 @@ for cluster_label, cluster_dataset in cluster_datasets.items():
     dataset_iterations = 1
     cluster_size = len(cluster_dataset)
     cluster_max_steps = dataset_iterations * (cluster_size // per_device_train_batch_size)
-    print(f'Training cluster {count}/{total} for {cluster_max_steps} steps...')
+    print(f'{count}/{total} Training {cluster_label} for {cluster_max_steps} steps...')
     
     # Set training parameters
     training_arguments = TrainingArguments(
@@ -214,7 +232,7 @@ for cluster_label, cluster_dataset in cluster_datasets.items():
     trainer.train()
 
     # Save the trained model
-    new_model_name = f"llama-2-7b-guanaco-{num_clusters}_{cluster_label}"
+    new_model_name = f"llama-2-7b-guanaco-{layer_config}-{num_clusters}_{cluster_label}"
     trainer.model.save_pretrained(new_model_name)
     print(f'Saved {new_model_name}')
     count += 1

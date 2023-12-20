@@ -1,5 +1,7 @@
 import os
 import torch
+import torch.nn as nn
+
 from datasets import load_dataset, Dataset
 from transformers import (
     AutoModelForCausalLM,
@@ -15,47 +17,57 @@ from trl import SFTTrainer
 
 model_name = "meta-llama/Llama-2-7b-hf"
 dataset_name = "timdettmers/openassistant-guanaco"
-new_model = "llama-2-7b-guanaco"
+
+
+attention_only = False
+layer_config = "attention" if attention_only else "all"
+new_model = f"llama-2-7b-guanaco-lora-{layer_config}"
 
 lora_r = 64
-lora_alpha = 16
+lora_alpha = 128
 lora_dropout = 0.1
-
 
 use_4bit = True
 bnb_4bit_compute_dtype = "float16"
 bnb_4bit_quant_type = "nf4"
 use_nested_quant = False
 
-
+report_to = "wandb"
 output_dir = "./results"
 num_train_epochs = 1
 fp16 = True
 bf16 = False
-per_device_train_batch_size = 1
-per_device_eval_batch_size = 1
-gradient_accumulation_steps = 1
+per_device_train_batch_size = 4
+gradient_accumulation_steps = 4
 gradient_checkpointing = True
 max_grad_norm = 0.3
 learning_rate = 2e-4
-weight_decay = 0.001
+# weight_decay = 0.001
+weight_decay = 0.0
 
+# Use these if the dataset has a test or validation split
+# ValueError: Trainer: evaluation requires an eval_dataset.
+# evaluation_strategy = "steps"
+# eval_steps = 187
+# per_device_eval_batch_size = 1
 
 optim = "paged_adamw_32bit"
 lr_scheduler_type = "cosine"
-max_steps = -1
 warmup_ratio = 0.03
 group_by_length = True
 
 save_steps = 0
-logging_steps = 25
-
-
+logging_steps = 10
 max_seq_length = None
 packing = False
 # device_map = {"": 0}
 
-dataset = load_dataset(dataset_name, split="train")
+dataset_path = "/scratch/alif/timdettmers___json/timdettmers--openassistant-guanaco-c93588435bc90172/0.0.0/fe5dd6ea2639a6df622901539cb550cf8797e5a6b2dd7af1cf934bed8e233e6e/"
+train_path = os.path.join(dataset_path, 'json-train.arrow')
+test_path = os.path.join(dataset_path, 'json-test.arrow')
+
+train_dataset = Dataset.from_file(train_path)
+test_dataset = Dataset.from_file(test_path)
 
 compute_dtype = getattr(torch, bnb_4bit_compute_dtype)
 
@@ -90,19 +102,39 @@ tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right" # Fix weird overflow issue with fp16 training
 
-# Load LoRA configuration
-peft_config = LoraConfig(
-    lora_alpha=lora_alpha,
-    lora_dropout=lora_dropout,
-    r=lora_r,
-    bias="none",
-    task_type="CAUSAL_LM",
-)
+# By default, LoRA is only applied to attention layers
+# https://github.com/huggingface/peft/blob/main/src/peft/utils/constants.py#L49
+# The QLoRA paper suggests that LoRA should be applied to all linear layers
+# https://github.com/huggingface/peft/issues/735
+if attention_only:
+    print(f'Configuring LoRA to be applied to attention layers...')
+    # Load LoRA configuration
+    peft_config = LoraConfig(
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        r=lora_r,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+else:
+    print(f'Configuring LoRA to be applied to all transformer linear layers...')
+    target_modules = [name for name, layer in model.named_modules() if isinstance(layer, nn.Linear)]
+
+    # Load LoRA configuration
+    peft_config = LoraConfig(
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        r=lora_r,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=target_modules # Applying LoRA to all linear layers
+    )
 
 # Set training parameters
 training_arguments = TrainingArguments(
     output_dir=output_dir,
-    num_train_epochs=num_train_epochs,
+    # num_train_epochs=num_train_epochs,
+    max_steps = 1875,
     per_device_train_batch_size=per_device_train_batch_size,
     gradient_accumulation_steps=gradient_accumulation_steps,
     optim=optim,
@@ -113,11 +145,10 @@ training_arguments = TrainingArguments(
     fp16=fp16,
     bf16=bf16,
     max_grad_norm=max_grad_norm,
-    max_steps=max_steps,
     warmup_ratio=warmup_ratio,
     group_by_length=group_by_length,
     lr_scheduler_type=lr_scheduler_type,
-    report_to=None
+    report_to=report_to
 )
 
 # Set supervised fine-tuning parameters

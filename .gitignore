@@ -6,5 +6,6 @@ __pycache__
 wandb/
 llama-2-7b*
 gpt2-*
+mistral-7b-*
 results/
 misc/

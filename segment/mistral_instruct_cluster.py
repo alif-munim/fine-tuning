@@ -21,6 +21,15 @@ import pandas as pd
 
 model_name = "mistralai/Mistral-7B-v0.1"
 dataset_name = "monology/VMware-open-instruct-higgsfield"
+cluster = "narval"
+
+# Load dataset from local path
+if cluster == "narval":
+    dataset_path = "/scratch/alif/monology___v_mware-open-instruct-higgsfield/default/0.0.0/622a7cf65a222fcb"
+    train_path = os.path.join(dataset_path, 'v_mware-open-instruct-higgsfield-train.arrow')
+    train_dataset = Dataset.from_file(train_path)
+elif cluster == "cedar":
+    train_dataset = load_dataset(dataset_name, split="train")
 
 lora_r = 64
 lora_alpha = 16
@@ -53,11 +62,6 @@ save_steps = 0
 logging_steps = 25
 max_seq_length = 512  # Adjust as needed
 packing = False
-
-# Load dataset from local path
-dataset_path = "/scratch/alif/monology___v_mware-open-instruct-higgsfield/default/0.0.0/622a7cf65a222fcb"
-train_path = os.path.join(dataset_path, 'v_mware-open-instruct-higgsfield-train.arrow')
-train_dataset = Dataset.from_file(train_path)
 
 compute_dtype = getattr(torch, bnb_4bit_compute_dtype)
 
@@ -92,28 +96,6 @@ peft_config = LoraConfig(
     task_type="CAUSAL_LM",
 )
 
-# Set training parameters
-training_arguments = TrainingArguments(
-    output_dir=output_dir,
-    num_train_epochs=num_train_epochs,
-    per_device_train_batch_size=per_device_train_batch_size,
-    per_device_eval_batch_size=per_device_eval_batch_size,
-    gradient_accumulation_steps=gradient_accumulation_steps,
-    optim=optim,
-    save_steps=save_steps,
-    logging_steps=logging_steps,
-    learning_rate=learning_rate,
-    weight_decay=weight_decay,
-    fp16=fp16,
-    bf16=bf16,
-    max_grad_norm=max_grad_norm,
-    max_steps=max_steps,
-    warmup_ratio=warmup_ratio,
-    group_by_length=group_by_length,
-    lr_scheduler_type=lr_scheduler_type,
-    report_to=None
-)
-
 
 # Clustering function
 def cluster_dataset(dataset, num_clusters):    
@@ -146,6 +128,29 @@ for cluster_label in clustered_data['cluster'].unique():
     # Apply preprocessing to concatenate 'prompt' and 'completion' into 'text'
     hf_dataset = hf_dataset.map(preprocess_function, batched=True)
     cluster_datasets[f"cluster_{cluster_label}"] = hf_dataset
+    
+    
+# Set training parameters
+training_arguments = TrainingArguments(
+    output_dir=output_dir,
+    num_train_epochs=num_train_epochs,
+    per_device_train_batch_size=per_device_train_batch_size,
+    per_device_eval_batch_size=per_device_eval_batch_size,
+    gradient_accumulation_steps=gradient_accumulation_steps,
+    optim=optim,
+    save_steps=save_steps,
+    logging_steps=logging_steps,
+    learning_rate=learning_rate,
+    weight_decay=weight_decay,
+    fp16=fp16,
+    bf16=bf16,
+    max_grad_norm=max_grad_norm,
+    max_steps=max_steps,
+    warmup_ratio=warmup_ratio,
+    group_by_length=group_by_length,
+    lr_scheduler_type=lr_scheduler_type,
+    report_to=None
+)
 
 
 # Tokenize and train models for each cluster

@@ -63,8 +63,6 @@ logging_steps = 25
 max_seq_length = 512  # Adjust as needed
 packing = False
 
-
-
 compute_dtype = getattr(torch, bnb_4bit_compute_dtype)
 
 bnb_config = BitsAndBytesConfig(
@@ -88,10 +86,7 @@ if compute_dtype == torch.float16 and use_4bit:
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
     quantization_config=bnb_config,
-    # device_map=device_map
 )
-model.config.use_cache = False
-model.config.pretraining_tp = 1
 
 # Load LLaMA tokenizer
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -136,8 +131,6 @@ training_arguments = TrainingArguments(
     lr_scheduler_type=lr_scheduler_type,
     report_to=None
 )
-
-
 
 print(f'Training single LoRA...')
 
