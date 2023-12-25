@@ -10,3 +10,5 @@ mistral-7b-*
 results/
 misc/
 lm_cache/
+mats/
+*.npy

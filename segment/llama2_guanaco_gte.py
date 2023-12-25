@@ -24,17 +24,42 @@ import pandas as pd
 import numpy as np
 from itertools import islice
 
+def preprocess_instruct(examples):
+    # Concatenate 'prompt' and 'completion' fields
+    texts = [prompt + " " + completion for prompt, completion in zip(examples['prompt'], examples['completion'])]
+    return {'text': texts}
+
 num_clusters = 4  # Adjust the number of clusters as needed
 resume_from = 0
-attention_only = True
-layer_config = "attention" if attention_only else "all"
-
 model_name = "meta-llama/Llama-2-7b-hf"
-# dataset_name = "timdettmers/openassistant-guanaco"
+dataset = "instruct"
+cluster = "narval"
+attention_only = True
+layer_config = "att" if attention_only else "lin"
+
+if cluster == "cedar":
+    if dataset == "guanaco":
+        dataset_name = "timdettmers/openassistant-guanaco"
+    elif dataset == "instruct":
+        dataset_name = "monology/VMware-open-instruct-higgsfield"
+    train_dataset = load_dataset(dataset_name, split="train")
+    print(f"Training dataset set to {dataset_name} from hugging face")
+
+if cluster == "narval":
+    if dataset == "guanaco":
+        dataset_path = "/scratch/alif/timdettmers___json/timdettmers--openassistant-guanaco-c93588435bc90172/0.0.0/fe5dd6ea2639a6df622901539cb550cf8797e5a6b2dd7af1cf934bed8e233e6e/json-train.arrow"
+    elif dataset == "instruct":
+        dataset_path = '/scratch/alif/monology___v_mware-open-instruct-higgsfield/default/0.0.0/622a7cf65a222fcb/v_mware-open-instruct-higgsfield-train.arrow'
+    train_dataset = Dataset.from_file(dataset_path)
+    train_dataset = train_dataset.map(preprocess_instruct, batched=True)
+    print(f"Training dataset set to: {dataset} from local path: {dataset_path}")
 
 lora_r = 64
-lora_alpha = 128
-lora_dropout = 0.1
+lora_alpha = 16
+lora_dropout_factor = 0
+lora_dropout = lora_dropout_factor * 0.1
+
+new_model = f"llama-2-7b-{dataset}-lora-{layer_config}-d{lora_dropout_factor}-r{lora_r}-a{lora_alpha}"
 
 use_4bit = True
 bnb_4bit_compute_dtype = "float16"
@@ -42,17 +67,18 @@ bnb_4bit_quant_type = "nf4"
 use_nested_quant = False
 
 report_to = "wandb"
-output_dir = "./results"
+output_dir = new_model
 num_train_epochs = 1
 fp16 = True
 bf16 = False
-per_device_train_batch_size = 4
-gradient_accumulation_steps = 4
+per_device_train_batch_size = 8
+gradient_accumulation_steps = 2
 gradient_checkpointing = True
 max_grad_norm = 0.3
 learning_rate = 2e-4
 # weight_decay = 0.001
 weight_decay = 0.0
+max_steps = 1875
 
 # Use these if the dataset has a test or validation split
 # ValueError: Trainer: evaluation requires an eval_dataset.
@@ -65,18 +91,11 @@ lr_scheduler_type = "cosine"
 warmup_ratio = 0.03
 group_by_length = True
 
-save_steps = 0
+save_steps = 500
 logging_steps = 10
 max_seq_length = None
 packing = False
 # device_map = {"": 0}
-
-dataset_path = "/scratch/alif/timdettmers___json/timdettmers--openassistant-guanaco-c93588435bc90172/0.0.0/fe5dd6ea2639a6df622901539cb550cf8797e5a6b2dd7af1cf934bed8e233e6e/"
-train_path = os.path.join(dataset_path, 'json-train.arrow')
-test_path = os.path.join(dataset_path, 'json-test.arrow')
-
-train_dataset = Dataset.from_file(train_path)
-test_dataset = Dataset.from_file(test_path)
 
 compute_dtype = getattr(torch, bnb_4bit_compute_dtype)
 
@@ -144,7 +163,11 @@ else:
 #### CLUSTERING #########
 
 print("Loading embeddings...")
-embeddings = np.load('embeddings.npy')
+
+if dataset == "instruct":
+    embeddings = np.load('instruct_embeddings.npy')
+elif dataset == "guanaco":
+    embeddings = np.load('embeddings.npy')
 
 def cluster_dataset(dataset, num_clusters, embeddings):    
     # Extract text data
@@ -189,9 +212,11 @@ for cluster_label, cluster_dataset in islice(cluster_datasets.items(), resume_fr
     cluster_max_steps = dataset_iterations * (cluster_size // per_device_train_batch_size)
     print(f'{count}/{total} Training {cluster_label} for {cluster_max_steps} steps...')
     
+    new_model_name = f"llama-2-7b-{dataset}_lora-{layer_config}-d{lora_dropout_factor}-r{lora_r}-a{lora_alpha}-{num_clusters}_{cluster_label}"
+    
     # Set training parameters
     training_arguments = TrainingArguments(
-        output_dir=output_dir,
+        output_dir=new_model_name,
         max_steps = cluster_max_steps,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -232,7 +257,6 @@ for cluster_label, cluster_dataset in islice(cluster_datasets.items(), resume_fr
     trainer.train()
 
     # Save the trained model
-    new_model_name = f"llama-2-7b-guanaco-{layer_config}-{num_clusters}_{cluster_label}"
     trainer.model.save_pretrained(new_model_name)
     print(f'Saved {new_model_name}')
     count += 1

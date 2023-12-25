@@ -10,10 +10,30 @@ from datasets import load_dataset, Dataset
 from sklearn.cluster import KMeans
 from tqdm import tqdm
 
+def preprocess_instruct(examples):
+    # Concatenate 'prompt' and 'completion' fields
+    texts = [prompt + " " + completion for prompt, completion in zip(examples['prompt'], examples['completion'])]
+    return {'text': texts}
 
-dataset_path = "/scratch/alif/timdettmers___json/timdettmers--openassistant-guanaco-c93588435bc90172/0.0.0/fe5dd6ea2639a6df622901539cb550cf8797e5a6b2dd7af1cf934bed8e233e6e/"
-train_path = os.path.join(dataset_path, 'json-train.arrow')
-train_dataset = Dataset.from_file(train_path)
+dataset = "instruct"
+cluster = "narval"
+
+if cluster == "cedar":
+    if dataset == "guanaco":
+        dataset_name = "timdettmers/openassistant-guanaco"
+    elif dataset == "instruct":
+        dataset_name = "monology/VMware-open-instruct-higgsfield"
+    train_dataset = load_dataset(dataset_name, split="train")
+    print(f"Training dataset set to {dataset_name} from hugging face")
+
+if cluster == "narval":
+    if dataset == "guanaco":
+        dataset_path = "/scratch/alif/timdettmers___json/timdettmers--openassistant-guanaco-c93588435bc90172/0.0.0/fe5dd6ea2639a6df622901539cb550cf8797e5a6b2dd7af1cf934bed8e233e6e/json-train.arrow"
+    elif dataset == "instruct":
+        dataset_path = '/scratch/alif/monology___v_mware-open-instruct-higgsfield/default/0.0.0/622a7cf65a222fcb/v_mware-open-instruct-higgsfield-train.arrow'
+    train_dataset = Dataset.from_file(dataset_path)
+    train_dataset = train_dataset.map(preprocess_instruct, batched=True)
+    print(f"Training dataset set to: {dataset} from local path: {dataset_path}")
 
 def average_pool(last_hidden_states, attention_mask):
     last_hidden = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
@@ -50,7 +70,8 @@ texts = [entry['text'] for entry in train_dataset]  # Extract texts from the dat
 
 # Get embeddings and save them
 embeddings = get_embeddings_in_batches(texts, model, tokenizer, batch_size=32)
-np.save('embeddings.npy', embeddings)
+fname = dataset + '_embeddings.npy'
+np.save(fname, embeddings)
 
 
 
