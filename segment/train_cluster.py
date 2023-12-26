@@ -29,9 +29,12 @@ def preprocess_instruct(examples):
     texts = [prompt + " " + completion for prompt, completion in zip(examples['prompt'], examples['completion'])]
     return {'text': texts}
 
+cluster_strategy = "embeddings"
 num_clusters = 4  # Adjust the number of clusters as needed
-resume_from = 0
-model_name = "meta-llama/Llama-2-7b-hf"
+resume_from = 1 # zero-indexed, resume from last incomplete run
+resume_from_checkpoint = "/scratch/alif/language-models/segment/llama-2-7b-instruct_lora-att-d0-r64-a16-4_cluster_1/checkpoint-500"
+
+model_name = "meta-llama/Llama-2-7b-hf" # Also try "mistralai/Mistral-7B-v0.1"
 dataset = "instruct"
 cluster = "narval"
 attention_only = True
@@ -54,8 +57,8 @@ if cluster == "narval":
     train_dataset = train_dataset.map(preprocess_instruct, batched=True)
     print(f"Training dataset set to: {dataset} from local path: {dataset_path}")
 
-lora_r = 64
-lora_alpha = 16
+lora_r = 64 # Rank equal to alpha is equivalent to scaling weights by 1
+lora_alpha = 16 # Keep this fixed while changing the rank
 lora_dropout_factor = 0
 lora_dropout = lora_dropout_factor * 0.1
 
@@ -162,14 +165,7 @@ else:
 
 #### CLUSTERING #########
 
-print("Loading embeddings...")
-
-if dataset == "instruct":
-    embeddings = np.load('instruct_embeddings.npy')
-elif dataset == "guanaco":
-    embeddings = np.load('embeddings.npy')
-
-def cluster_dataset(dataset, num_clusters, embeddings):    
+def cluster_embeddings(dataset, num_clusters, embeddings):    
     # Extract text data
     texts = [entry['text'] for entry in dataset]
 
@@ -185,10 +181,33 @@ def cluster_dataset(dataset, num_clusters, embeddings):
 
     return clustered_data
 
+def cluster_tfid(dataset, num_clusters):    
+    # Extract text data (adjust the key 'text' if your dataset has a different text field)
+    texts = [entry['text'] for entry in dataset]
 
-# Cluster the dataset using precomputed embeddings
-print(f'Creating {num_clusters} clusters from precomputed embeddings...')
-clustered_data = cluster_dataset(train_dataset, num_clusters, embeddings)
+    # Data Preparation and Feature Extraction
+    vectorizer = TfidfVectorizer(stop_words='english')
+    X = vectorizer.fit_transform(texts)
+
+    # Clustering
+    kmeans = KMeans(n_clusters=num_clusters, random_state=0)
+    kmeans.fit(X)
+
+    # Assigning cluster labels to each text
+    cluster_labels = kmeans.labels_
+
+    # Creating a DataFrame for easier visualization
+    clustered_data = pd.DataFrame({'text': texts, 'cluster': cluster_labels})
+
+    return clustered_data
+
+if cluster_strategy == "embeddings":
+    embeddings = np.load(f'{dataset}_embeddings.npy')
+    clustered_data = cluster_embeddings(train_dataset, num_clusters, embeddings)
+    print(f'Created {num_clusters} clusters from precomputed embeddings file: {dataset}_embeddings.npy')
+elif cluster_strategy == "tfid":
+    clustered_data = cluster_tfid(train_dataset, num_clusters)
+
 unique_clusters = clustered_data['cluster'].unique()
 cluster_datasets = {}
 
@@ -216,8 +235,9 @@ for cluster_label, cluster_dataset in islice(cluster_datasets.items(), resume_fr
     
     # Set training parameters
     training_arguments = TrainingArguments(
+        resume_from_checkpoint=resume_from_checkpoint,
         output_dir=new_model_name,
-        max_steps = cluster_max_steps,
+        max_steps = cluster_max_steps, # Need to investigate how many steps or epochs to train for
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         optim=optim,
@@ -254,7 +274,12 @@ for cluster_label, cluster_dataset in islice(cluster_datasets.items(), resume_fr
     )
 
     # Train the model for this cluster
-    trainer.train()
+    checkpoint = None
+    if training_arguments.resume_from_checkpoint is not None:
+        checkpoint = training_arguments.resume_from_checkpoint
+        
+    print(f'Resuming {cluster_label} model training from {resume_from_checkpoint}')
+    trainer.train(resume_from_checkpoint=checkpoint)
 
     # Save the trained model
     trainer.model.save_pretrained(new_model_name)

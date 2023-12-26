@@ -3,42 +3,10 @@
 # Use conjugate gradient calculation from scipy
 from scipy.sparse.linalg import cg
 
-def _create_dataLoader(pytorch_dataset, batch_size, should_shuffle, world_size, device):
-    if is_distributedSetup(world_size):
-        sampler = DistributedSampler(
-            pytorch_dataset,
-            num_replicas=world_size,
-            rank=device,
-            shuffle=should_shuffle,
-        )
 
-        data_loader = data.DataLoader(
-            pytorch_dataset,
-            batch_size=batch_size,
-            num_workers=0,
-            shuffle=False,
-            sampler=sampler,
-            collate_fn=pytorch_dataset.collate_fn,
-        )
-        return sampler, data_loader
-    else:
-        data_loader = data.DataLoader(
-            pytorch_dataset,
-            batch_size=batch_size,
-            num_workers=0,
-            shuffle=should_shuffle,
-            collate_fn=pytorch_dataset.collate_fn,
-        )
 
-        return None, data_loader
-    
-def get_epoch_batches(pytorch_dataset, batch_size, world_size, device):
-    _, data_loader = _create_dataLoader(
-        pytorch_dataset, batch_size, False, world_size, device
-    )
 
-    for x in data_loader:
-        yield x
+# FISHER MERGING METHODS
 
 def compute_diag_fisher(model, param_regex):
     example_fisher = {}
@@ -134,9 +102,112 @@ def conjugate_gradient_forward(
     
     
 
+    
+# DATASET AND CHECKPOINT LOADING
+    
+def get_dataset(filepath)
+
+def load_checkpoints(pretrained_model, num_clusters, device)
+    """
+    Load model (adapter) checkpoints to merge.
+    
+    Args:
+        pretrained_model: name of the base model (e.g. llama-2-7b)
+        num_clusters: number of dataset clusters to retrieve adapter checkpoints
+        device: device to load checkpoints onto (e.g. cpu or cuda)
+    Return:
+        checkpoint_paths: checkpoint file paths (to retrieve fishers later)
+        loaded_checkpoints: adapter checkpoints to merge 
+    """
+
+def _create_dataLoader(pytorch_dataset, batch_size, should_shuffle, world_size, device):
+    if is_distributedSetup(world_size):
+        sampler = DistributedSampler(
+            pytorch_dataset,
+            num_replicas=world_size,
+            rank=device,
+            shuffle=should_shuffle,
+        )
+
+        data_loader = data.DataLoader(
+            pytorch_dataset,
+            batch_size=batch_size,
+            num_workers=0,
+            shuffle=False,
+            sampler=sampler,
+            collate_fn=pytorch_dataset.collate_fn,
+        )
+        return sampler, data_loader
+    else:
+        data_loader = data.DataLoader(
+            pytorch_dataset,
+            batch_size=batch_size,
+            num_workers=0,
+            shuffle=should_shuffle,
+            collate_fn=pytorch_dataset.collate_fn,
+        )
+
+        return None, data_loader
+    
+def get_epoch_batches(pytorch_dataset, batch_size, world_size, device):
+    _, data_loader = _create_dataLoader(
+        pytorch_dataset, batch_size, False, world_size, device
+    )
+
+    for x in data_loader:
+        yield x
+
+
+        
+        
+
+# MODEL OPERATIONS
+
+def map_params(model_params, map_fn):
+    new_params = {}
+    for param_name, param_value in model_params.items():
+        new_params[param_name] = map_fn(param_value)
+    return new_params
+
+def reduce_params(model_params, reduce_fn):
+    param_values = zip(*list(map(lambda x: x.values(), model_params)))
+    param_names = model_params[0].keys()
+    
+    new_params = {}
+    for param_name, param_value in zip(*[param_names, param_values]):
+        new_params[param_name] = reduce_fn(torch.stack(list(param_value), dim=0))
+    return new_params
+
+def scale(model_params, scaler):
+    scale_fn = lambda x: x * scaler
+    scaled_model = map_params(model_params, scale_fn)
+    return scaled_model
+
+def scale_and_sum(model_params, model_lambda):
+    sum fn = lambda params: torch.sum(params * model_lambda, dim=0)
+    summed_model = reduce_params(model_params, sum_fn)
+    return summed_model
+
+def pairwise_param_map(params_a, params_b, map_fn):
+    all_params = params_a.keys()
+    new_params = {}
+    
+    for param_name in all_params:
+        new_params[param_name] = map_fn(params_a[param_name], params_b[param_name])
+    return new_params
+
+def element_wise_multiply(params_a, params_b):
+    element_wise_mul = lambda x, y: torch.mul(x, y)
+    element_wise_mul_model = pairwise_param_map(params_a, params_b, element_wise_mul)
+    return element_wise_mul_model
+
+
+
+
+
 if __name__ == "__main__":
     
-    # First step is to compute fishers
+    # COMPUTE FISHERS
     # https://github.com/r-three/mats/blob/main/src/merging/save_metadata/save_fisher.py
     
     model_config, data_config, eval_config = args
@@ -148,12 +219,40 @@ if __name__ == "__main__":
         get_model_fisher(model, dataset, device, world_size, fisher_path)
         
         
-        
-    # Next step is to merge fishers
+    # MERGE FISHERS
     # https://github.com/r-three/mats/blob/main/src/merging/diagonal_fisherMerging.py
-    for dataset, combined_matrix in combined_matrices.items():
-        checkpoint = combined_matrices["checkpoint"]
-        fisher = combined_matrices["fisher"]
+    
+    # Load checkpoints
+    pretrained_model = "llama-2-7b"
+    num_clusters = 2
+    checkpoint_paths, loaded_checkpoints = load_checkpoints(pretrained_model, num_clusters, torch.device("cpu"))
+    
+    # Load fishers
+    loaded_fishers = {}
+    for checkpoint_path in checkpoint_paths:
+        fisher_path = "fisher_" + checkpoint_path
+        fisher = torch.load(fisher_path, torch.device("cpu"))
+        loaded_fishers[checkpoint_path] = fisher
+    
+    checkpoint_fisher_matrices = {}
+    
+    # The original implementation merges checkpoints by dataset
+    # For adapters, merge checkpoints by cluster
+    for checkpoint_path, loaded_checkpoint in loaded_checkpoints.items():
+        dataset = get_dataset(checkpoint_path)
+        checkpoint_fisher_matrices[dataset] = {"checkpoint": loaded_checkpoint}
+        
+    for fisher_path, loaded_fisher in loaded_fishers.items():
+        dataset = get_dataset(fisher_path)
+        checkpoint_fisher_matrices[dataset].update({"fisher": fisher})
+    
+    
+    weighted_checkpoint_list = []
+    fisher_list = []
+    
+    for dataset, checkpoint_fisher_matrix in checkpoint_fisher_matrices.items():
+        checkpoint = checkpoint_fisher_matrix["checkpoint"]
+        fisher = checkpoint_fisher_matrix["fisher"]
         
         fisher = set_minimum(fisher, 1e-8)
         
@@ -181,8 +280,25 @@ if __name__ == "__main__":
     
         
         
-    # Compare: conjugate gradient method? (MaTS)
+    # COMPARE: CONJUGATE GRADIENTS (MaTS)
     # https://github.com/r-three/mats/blob/main/src/merging/conjugateGradient_diagonalFisher.py
+    
+    checkpoint_gram_matrices = {}
+    all_param_names = None
+    
+    for checkpoint_path, loaded_checkpoint in loaded_checkpoints.items():
+        dataset = get_dataset(checkpoint_path)
+        checkpoint_gram_matrices[dataset] = {"checkpoint": loaded_checkpoint}
+        
+    for fisher_path, loaded_fisher in loaded_fishers.items():
+        dataset = get_dataset(fisher_path)
+        checkpoint_gram_matrices[dataset].update({"fisher": fisher})
+        all_param_names = loaded_fisher.keys()
+        
+    datasets_fishers = []
+    datasets_weights = []
+    datasets_fisher_times_weight = []
+    datasets_nonmerged_weights = []
     
     for dataset, checkpoint_gram_matrix in checkpoint_gram_matrices.items():
         checkpoint = checkpoint_gram_matrix["checkpoint"]

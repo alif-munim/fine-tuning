@@ -11,18 +11,22 @@ from transformers import (
     TrainingArguments,
     pipeline,
     logging,
+    TrainerCallback
 )
 from peft import LoraConfig, PeftModel
 from trl import SFTTrainer
+
 
 def preprocess_instruct(examples):
     # Concatenate 'prompt' and 'completion' fields
     texts = [prompt + " " + completion for prompt, completion in zip(examples['prompt'], examples['completion'])]
     return {'text': texts}
 
-model_name = "meta-llama/Llama-2-7b-hf"
+model_name = "meta-llama/Llama-2-7b-hf" # Also try "mistralai/Mistral-7B-v0.1"
 dataset = "instruct"
 cluster = "narval"
+resume_from_checkpoint = None
+
 attention_only = True
 layer_config = "att" if attention_only else "lin"
 
@@ -40,10 +44,10 @@ if cluster == "narval":
     elif dataset == "instruct":
         dataset_path = '/scratch/alif/monology___v_mware-open-instruct-higgsfield/default/0.0.0/622a7cf65a222fcb/v_mware-open-instruct-higgsfield-train.arrow'
     train_dataset = Dataset.from_file(dataset_path)
-    train_dataset = train_dataset.map(preprocess_function, batched=True)
+    train_dataset = train_dataset.map(preprocess_instruct, batched=True)
     print(f"Training dataset set to: {dataset} from local path: {dataset_path}")
 
-lora_r = 64
+lora_r = 16
 lora_alpha = 16
 lora_dropout_factor = 0
 lora_dropout = lora_dropout_factor * 0.1
@@ -56,12 +60,12 @@ bnb_4bit_quant_type = "nf4"
 use_nested_quant = False
 
 report_to = "wandb"
-output_dir = "./results"
-num_train_epochs = 1
+output_dir = new_model
+num_train_epochs = 2
 fp16 = True
 bf16 = False
-per_device_train_batch_size = 4
-gradient_accumulation_steps = 4
+per_device_train_batch_size = 8
+gradient_accumulation_steps = 2
 gradient_checkpointing = True
 max_grad_norm = 0.3
 learning_rate = 2e-4
@@ -150,8 +154,8 @@ else:
 # Set training parameters
 training_arguments = TrainingArguments(
     output_dir=output_dir,
-    # num_train_epochs=num_train_epochs,
-    max_steps = max_steps,
+    num_train_epochs=num_train_epochs,
+    # max_steps = max_steps,
     per_device_train_batch_size=per_device_train_batch_size,
     gradient_accumulation_steps=gradient_accumulation_steps,
     optim=optim,
@@ -168,6 +172,30 @@ training_arguments = TrainingArguments(
     report_to=report_to
 )
 
+class PeftSavingCallback(TrainerCallback):
+    def on_save(self, args, state, control, **kwargs):
+        checkpoint_path = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        kwargs["model"].save_pretrained(checkpoint_path)
+
+        if "pytorch_model.bin" in os.listdir(checkpoint_path):
+            os.remove(os.path.join(checkpoint_path, "pytorch_model.bin"))
+            
+class SaveEpochCallback(TrainerCallback):
+    def __init__(self, save_path):
+        self.save_path = save_path
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        epoch = state.epoch
+        model_save_path = f"{self.save_path}_epoch_{epoch}"
+        kwargs['model'].save_pretrained(model_save_path)
+        print(f"Model saved to {model_save_path} at the end of epoch {epoch}")
+
+        
+# Initialize both callbacks
+save_model_callback = SaveModelCallback(new_model)
+peft_saving_callback = PeftSavingCallback()
+callbacks = [save_model_callback, peft_saving_callback]
+        
 # Set supervised fine-tuning parameters
 trainer = SFTTrainer(
     model=model,
@@ -178,11 +206,13 @@ trainer = SFTTrainer(
     tokenizer=tokenizer,
     args=training_arguments,
     packing=packing,
+    callbacks=callbacks,
 )
 
-# Train model
-trainer.train()
-
-# Save trained model
-trainer.model.save_pretrained(new_model)
-print(f'Saved {new_model}')
+checkpoint = None
+if training_arguments.resume_from_checkpoint is not None:
+    checkpoint = training_arguments.resume_from_checkpoint
+    print(f'Resuming {cluster_label} model training from {resume_from_checkpoint}')
+else:
+    print(f'Starting new training run for model: {new_model}')
+trainer.train(resume_from_checkpoint=checkpoint)
