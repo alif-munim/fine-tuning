@@ -192,7 +192,7 @@ class SaveEpochCallback(TrainerCallback):
 
         
 # Initialize both callbacks
-save_model_callback = SaveModelCallback(new_model)
+save_model_callback = SaveEpochCallback(new_model)
 peft_saving_callback = PeftSavingCallback()
 callbacks = [save_model_callback, peft_saving_callback]
         
