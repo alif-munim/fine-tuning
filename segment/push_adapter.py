@@ -14,12 +14,12 @@ from peft import LoraConfig, PeftModel
 from trl import SFTTrainer
 
 model_name = "meta-llama/Llama-2-7b-hf"
-adapter_model = "llama-2-7b-guanaco-lora-all-adapter"
+adapter_model = "llama-2-7b-guanaco_lora-att-d1-r64-a16-2_cluster_0"
 
 # model_name = "mistralai/Mistral-7B-v0.1"
 # adapter_model = "mistral-7b-instruct-qlora"
 
-new_model = "llama-2-7b-guanaco-lora-all"
+new_model = "llama-2-7b-guanaco_lora-att-d1-r64-a16-2_cluster_0"
 
 
 # Reload model in FP16 and merge it with LoRA weights

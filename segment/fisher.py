@@ -1,9 +1,31 @@
 # Trainable param regex: https://github.com/r-three/mats/blob/a7165f84cff194596465b50c49a49bcd4dbd0fbe/src/model/load_model.py#L63
 
 # Use conjugate gradient calculation from scipy
-from scipy.sparse.linalg import cg
+import os
+import re
+from scipy.sparse.linalg import LinearOperator, cg # for conjugate gradient methods
+from safetensors import safe_open # for checkpoint loading
+from safetensors.torch import load_model, save_model, load_file
+from datasets import load_dataset
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    HfArgumentParser,
+    TrainingArguments,
+    pipeline,
+    logging,
+)
+from peft import LoraConfig, PeftModel
 
+import torch
+from torch.utils import data
+from torch.utils.data import DataLoader
+from transformers import DataCollatorWithPadding
+from torch.utils.data.distributed import DistributedSampler
 
+from tqdm import tqdm # for progress bar in loops
+import numpy as np # for operations like norm and reshape in conjugate gradient
 
 
 # FISHER MERGING METHODS
@@ -18,31 +40,63 @@ def compute_diag_fisher(model, param_regex):
     return example_fisher
     
 
-def get_model_fisher(model, dataset, device, world_size, fisher_path):
+def get_model_fisher(checkpoint_path, dataset, device, world_size, fisher_path):
+    
+    model_name = "meta-llama/Llama-2-7b-hf"
+    adapter_model = "llama-2-7b-guanaco_lora-att-d1-r64-a16-2_cluster_1/epoch_1/"
+
+    # Reload model in FP16 and merge it with LoRA weights
+    base_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        low_cpu_mem_usage=True,
+        return_dict=True,
+        torch_dtype=torch.float32,
+        # device_map=device_map,
+    )
+    model = PeftModel.from_pretrained(base_model, adapter_model)
+    model = model.merge_and_unload()
+
+    # Reload tokenizer to save it
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    # tokenizer.pad_token = tokenizer.eos_token
+    # tokenizer.padding_side = "right"
     
     model.eval()
     stored_fisher = {}
     
     def update_fisher(example_fisher):
-    for param_name, value in example_fisher.items():
-        if param_name not in stored_fisher:
-            stored_fisher[param_name] = value
-        else:
-            stored_fisher[param_name] += value
+        for param_name, value in example_fisher.items():
+            if param_name not in stored_fisher:
+                stored_fisher[param_name] = value
+            else:
+                stored_fisher[param_name] += value
+    rank = 0
     
     iterator = get_epoch_batches(
         dataset,
         batch_size=1,
+        should_shuffle=True,
         world_size=world_size,
-        device=device
+        rank=rank,
+        device=device,
+        tokenizer=tokenizer
     )
     
     num_samples = 0
     param_regex = ".*"
     
     for batch in iterator:
+        inputs = tokenizer(batch, return_tensors='pt')
+        inputs['labels'] = inputs.input_ids[:, 1:].contiguous()
+        inputs.input_ids = inputs.input_ids[:, :-1].contiguous()
+    
+        
         # Fisher is the gradient of the log likelihood (negative loss of log prob)
-        loss, _ = model(batch)
+        print(batch)
+        outputs = model(**inputs)
+        
+        # outputs = model(**batch)
+        loss = outputs.loss
         log_prob = -loss
         log_prob.backward()
         
@@ -105,60 +159,106 @@ def conjugate_gradient_forward(
     
 # DATASET AND CHECKPOINT LOADING
     
-def get_dataset(filepath)
+def get_cluster(checkpoint):
+    # Define a regular expression pattern to capture the cluster name
+    pattern = re.compile(r"cluster_\d+")
+    
+    # Find all matches of the pattern in the checkpoint path
+    matches = pattern.findall(checkpoint_path)
+    
+    # Return the last occurrence of the cluster pattern
+    return matches[-1] if matches else None
 
-def load_checkpoints(pretrained_model, num_clusters, device)
+def load_checkpoints(pretrained_model, num_clusters, device):
     """
     Load model (adapter) checkpoints to merge.
-    
+
     Args:
         pretrained_model: name of the base model (e.g. llama-2-7b)
         num_clusters: number of dataset clusters to retrieve adapter checkpoints
         device: device to load checkpoints onto (e.g. cpu or cuda)
     Return:
-        checkpoint_paths: checkpoint file paths (to retrieve fishers later)
-        loaded_checkpoints: adapter checkpoints to merge 
+        checkpoint_dict: a dictionary with checkpoint folder names as keys and full checkpoint file paths as values
     """
 
-def _create_dataLoader(pytorch_dataset, batch_size, should_shuffle, world_size, device):
+    checkpoint_dict = {}
+    base_path = "./"
+
+    for cluster_idx in range(num_clusters):
+        cluster_name = f"{pretrained_model}_cluster_{cluster_idx}"
+        cluster_path = os.path.join(base_path, cluster_name)
+
+        # Now we need to find the latest epoch in this cluster
+        epochs = [d for d in os.listdir(cluster_path) if d.startswith('epoch')]
+        if not epochs:
+            raise FileNotFoundError(f"No epochs found in {cluster_path}")
+
+        latest_epoch = sorted(epochs, key=lambda x: int(x.split('_')[1]), reverse=True)[0]
+        checkpoint_file = os.path.join(cluster_path, latest_epoch, "adapter_model.safetensors")
+
+        if not os.path.isfile(checkpoint_file):
+            raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_file}")
+
+        # Map the cluster folder name to the full path of the checkpoint file
+        checkpoint_dict[cluster_name] = checkpoint_file
+
+    return checkpoint_dict
+
+def is_distributedSetup(world_size):
+    return world_size > 1
+
+def _create_dataLoader(hf_dataset, batch_size, should_shuffle, world_size, rank, collate_fn=None):
+    """
+    Create a PyTorch DataLoader from a Hugging Face dataset.
+    """
     if is_distributedSetup(world_size):
         sampler = DistributedSampler(
-            pytorch_dataset,
+            hf_dataset,
             num_replicas=world_size,
-            rank=device,
+            rank=rank,
             shuffle=should_shuffle,
         )
 
-        data_loader = data.DataLoader(
-            pytorch_dataset,
+        data_loader = DataLoader(
+            hf_dataset,
             batch_size=batch_size,
             num_workers=0,
             shuffle=False,
             sampler=sampler,
-            collate_fn=pytorch_dataset.collate_fn,
+            # collate_fn=collate_fn,
         )
         return sampler, data_loader
     else:
-        data_loader = data.DataLoader(
-            pytorch_dataset,
+        data_loader = DataLoader(
+            hf_dataset,
             batch_size=batch_size,
             num_workers=0,
             shuffle=should_shuffle,
-            collate_fn=pytorch_dataset.collate_fn,
+            # collate_fn=collate_fn,
         )
 
         return None, data_loader
     
-def get_epoch_batches(pytorch_dataset, batch_size, world_size, device):
+def get_epoch_batches(hf_dataset, batch_size, should_shuffle, world_size, rank, device, tokenizer):
+    """
+    Get batches of data for an epoch, moving each batch to the specified device after tokenization.
+    """
+    # collate_fn = DataCollatorWithPadding(tokenizer=tokenizer)  # Use the tokenizer for padding
+    
     _, data_loader = _create_dataLoader(
-        pytorch_dataset, batch_size, False, world_size, device
+        hf_dataset, batch_size, should_shuffle, world_size, rank, 
+        # collate_fn
     )
 
-    for x in data_loader:
-        yield x
-
-
+    for batch in data_loader:
+        # Tokenize the text strings in the batch
+#         inputs = tokenizer(batch['text'], return_tensors='pt', padding=True, truncation=True)
+#         inputs['labels'] = inputs.input_ids[:, 1:].contiguous()
+#         inputs.input_ids = inputs.input_ids[:, :-1].contiguous()
         
+#         # Move the tokenized inputs to the specified device
+#         inputs = {k: v.to(device) for k, v in inputs.items()}
+        yield batch['text']
         
 
 # MODEL OPERATIONS
@@ -184,7 +284,7 @@ def scale(model_params, scaler):
     return scaled_model
 
 def scale_and_sum(model_params, model_lambda):
-    sum fn = lambda params: torch.sum(params * model_lambda, dim=0)
+    sum_fn = lambda parameters: torch.sum(parameters * model_lambda, dim=0)
     summed_model = reduce_params(model_params, sum_fn)
     return summed_model
 
@@ -202,6 +302,12 @@ def element_wise_multiply(params_a, params_b):
     return element_wise_mul_model
 
 
+# HF Functions
+
+def preprocess_instruct(examples):
+    # Concatenate 'prompt' and 'completion' fields
+    texts = [prompt + " " + completion for prompt, completion in zip(examples['prompt'], examples['completion'])]
+    return {'text': texts}
 
 
 
@@ -210,51 +316,81 @@ if __name__ == "__main__":
     # COMPUTE FISHERS
     # https://github.com/r-three/mats/blob/main/src/merging/save_metadata/save_fisher.py
     
-    model_config, data_config, eval_config = args
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset_list = ["guanaco"]
+    dataset = "instruct"
+    cluster = "cedar"
+    world_size = 1
+
+    if cluster == "cedar":
+        if dataset == "guanaco":
+            dataset_name = "timdettmers/openassistant-guanaco"
+        elif dataset == "instruct":
+            dataset_name = "monology/VMware-open-instruct-higgsfield"
+        train_dataset = load_dataset(dataset_name, split="train")
+        train_dataset = train_dataset.map(preprocess_instruct, batched=True)
+        print(f"Training dataset set to {dataset_name} from hugging face")
+
+    if cluster == "narval":
+        if dataset == "guanaco":
+            dataset_path = "/scratch/alif/timdettmers___json/timdettmers--openassistant-guanaco-c93588435bc90172/0.0.0/fe5dd6ea2639a6df622901539cb550cf8797e5a6b2dd7af1cf934bed8e233e6e/json-train.arrow"
+        elif dataset == "instruct":
+            dataset_path = '/scratch/alif/monology___v_mware-open-instruct-higgsfield/default/0.0.0/622a7cf65a222fcb/v_mware-open-instruct-higgsfield-train.arrow'
+        train_dataset = Dataset.from_file(dataset_path)
+        train_dataset = train_dataset.map(preprocess_instruct, batched=True)
+        print(f"Training dataset set to: {dataset} from local path: {dataset_path}")
     
-    for dataset in dataset_list:
-        fisher_path = "model_dataset_fisher.pt"
-        get_model_fisher(model, dataset, device, world_size, fisher_path)
+    
+    # model_config, data_config, eval_config = args
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # dataset_list = [train_dataset]
+    
+    # Load checkpoints
+    pretrained_model = "llama-2-7b-guanaco_lora-att-d1-r64-a16-2"
+    num_clusters = 2
+    checkpoint_dict = load_checkpoints(pretrained_model, num_clusters, torch.device("cpu"))
+    
+    for model_folder in checkpoint_dict.keys():
+        fisher_name = f"{model_folder}_fisher.pt"
+        fisher_path = os.path.join('fishers/', fisher_name)
+        # model = load_file(checkpoint_dict[model_folder])
+        checkpoint_path = checkpoint_dict[model_folder]
+        get_model_fisher(checkpoint_path, train_dataset, device, world_size, fisher_path)
+        print(f'Saved fisher for {model_folder} at {fisher_path}')
         
         
     # MERGE FISHERS
     # https://github.com/r-three/mats/blob/main/src/merging/diagonal_fisherMerging.py
     
-    # Load checkpoints
-    pretrained_model = "llama-2-7b"
-    num_clusters = 2
-    checkpoint_paths, loaded_checkpoints = load_checkpoints(pretrained_model, num_clusters, torch.device("cpu"))
-    
     # Load fishers
     loaded_fishers = {}
-    for checkpoint_path in checkpoint_paths:
-        fisher_path = "fisher_" + checkpoint_path
+    for model_folder in checkpoint_dict.keys():
+        fisher_path = f"{model_folder}_fisher.pt"
         fisher = torch.load(fisher_path, torch.device("cpu"))
-        loaded_fishers[checkpoint_path] = fisher
+        loaded_fishers[model_folder] = fisher
     
     checkpoint_fisher_matrices = {}
     
     # The original implementation merges checkpoints by dataset
     # For adapters, merge checkpoints by cluster
-    for checkpoint_path, loaded_checkpoint in loaded_checkpoints.items():
-        dataset = get_dataset(checkpoint_path)
-        checkpoint_fisher_matrices[dataset] = {"checkpoint": loaded_checkpoint}
+    for model_folder, checkpoint_path in loaded_checkpoints.items():
+        cluster = get_cluster(checkpoint_path)
+        checkpoint_fisher_matrices[cluster] = {"checkpoint": checkpoint_path}
         
-    for fisher_path, loaded_fisher in loaded_fishers.items():
-        dataset = get_dataset(fisher_path)
-        checkpoint_fisher_matrices[dataset].update({"fisher": fisher})
+    for model_folder, loaded_fisher in loaded_fishers.items():
+        cluster = get_cluster(model_folder)
+        checkpoint_fisher_matrices[cluster].update({"fisher": fisher})
     
     
     weighted_checkpoint_list = []
     fisher_list = []
     
-    for dataset, checkpoint_fisher_matrix in checkpoint_fisher_matrices.items():
-        checkpoint = checkpoint_fisher_matrix["checkpoint"]
+    for cluster, checkpoint_fisher_matrix in checkpoint_fisher_matrices.items():
+        checkpoint_path = checkpoint_fisher_matrix["checkpoint"]
+        checkpoint = load_file(checkpoint_path)
+        print(f'Loaded checkpoint for {cluster}')
+
         fisher = checkpoint_fisher_matrix["fisher"]
-        
         fisher = set_minimum(fisher, 1e-8)
+        print(f'Loaded fisher for {cluster}')
         
         # Scale fishers
         if len(loaded_checkpoints) == 2:
@@ -276,87 +412,89 @@ if __name__ == "__main__":
         scale_and_sum(fisher_list, 1)
     )
     
-    torch.save(merged_model, "merged_model.pt")
+    merged_path = os.path.join('merged_models/', 'merged_model.pt')
+    torch.save(merged_model, merged_path)
+    print(f'Merged models and saved to {merged_path}')
     
         
         
     # COMPARE: CONJUGATE GRADIENTS (MaTS)
     # https://github.com/r-three/mats/blob/main/src/merging/conjugateGradient_diagonalFisher.py
     
-    checkpoint_gram_matrices = {}
-    all_param_names = None
+#     checkpoint_gram_matrices = {}
+#     all_param_names = None
     
-    for checkpoint_path, loaded_checkpoint in loaded_checkpoints.items():
-        dataset = get_dataset(checkpoint_path)
-        checkpoint_gram_matrices[dataset] = {"checkpoint": loaded_checkpoint}
+#     for checkpoint_path, loaded_checkpoint in loaded_checkpoints.items():
+#         dataset = get_cluster(checkpoint_path)
+#         checkpoint_gram_matrices[dataset] = {"checkpoint": loaded_checkpoint}
         
-    for fisher_path, loaded_fisher in loaded_fishers.items():
-        dataset = get_dataset(fisher_path)
-        checkpoint_gram_matrices[dataset].update({"fisher": fisher})
-        all_param_names = loaded_fisher.keys()
+#     for fisher_path, loaded_fisher in loaded_fishers.items():
+#         dataset = get_cluster(fisher_path)
+#         checkpoint_gram_matrices[dataset].update({"fisher": fisher})
+#         all_param_names = loaded_fisher.keys()
         
-    datasets_fishers = []
-    datasets_weights = []
-    datasets_fisher_times_weight = []
-    datasets_nonmerged_weights = []
+#     datasets_fishers = []
+#     datasets_weights = []
+#     datasets_fisher_times_weight = []
+#     datasets_nonmerged_weights = []
     
-    for dataset, checkpoint_gram_matrix in checkpoint_gram_matrices.items():
-        checkpoint = checkpoint_gram_matrix["checkpoint"]
+#     for dataset, checkpoint_gram_matrix in checkpoint_gram_matrices.items():
+#         checkpoint = checkpoint_gram_matrix["checkpoint"]
         
-        fisher_matrices = {}
-        weights = {}
+#         fisher_matrices = {}
+#         weights = {}
         
-        for module_name, diag_fisher in checkpoint_gram_matrix["diagonal_fisher"].items():
-            param_name = module_name
-            weights[param_name] = checkpoint[param_name]
-            fisher_matrices[param_name] = diag_fisher
+#         for module_name, diag_fisher in checkpoint_gram_matrix["diagonal_fisher"].items():
+#             param_name = module_name
+#             weights[param_name] = checkpoint[param_name]
+#             fisher_matrices[param_name] = diag_fisher
             
-        datasets_fishers.append(fisher_matrices)
-        datasets_weights.append(weights)
+#         datasets_fishers.append(fisher_matrices)
+#         datasets_weights.append(weights)
         
-        fisher_times_weight = element_wise_multiply(fisher_matrices, weights)
-        datasets_fisher_times_weight.append(fisher_times_weight)
+#         fisher_times_weight = element_wise_multiply(fisher_matrices, weights)
+#         datasets_fisher_times_weight.append(fisher_times_weight)
         
-        nonmerged_weights = {}
-        for param_name, param in checkpoint.items()
-            if param_name not in fisher_matrices:
-                nonmerged_weights[param_name] = param
-        datasets_nonmerged_weights.append(nonmerged_weights)
+#         nonmerged_weights = {}
+#         for param_name, param in checkpoint.items()
+#             if param_name not in fisher_matrices:
+#                 nonmerged_weights[param_name] = param
+#         datasets_nonmerged_weights.append(nonmerged_weights)
         
-        average_weights = scale_and_sum(datasets_weights, 1 / len(datasets_weights))
+#         average_weights = scale_and_sum(datasets_weights, 1 / len(datasets_weights))
         
-        sum_fisher_matrices = scale_and_sum(datasets_fishers, 1)
-        sum_fisher_times_weight = scale_and_sum(datasets_fisher_times_weight, 1)
+#         sum_fisher_matrices = scale_and_sum(datasets_fishers, 1)
+#         sum_fisher_times_weight = scale_and_sum(datasets_fisher_times_weight, 1)
         
         
         
-        if initialization == "average":
-            init_model = average_weights
-        elif initialization == "pretrained":
-            init_model = pretrained_checkpoint
-        else:
-            if initialization is not None:
-                init_model = {}
-                # Transpose weights
-                for param_name, param in torch.load(initialization).items():
-                    init_model[param_name] = param
-            else:
-                init_model = None
+#         if initialization == "average":
+#             init_model = average_weights
+#         elif initialization == "pretrained":
+#             init_model = pretrained_checkpoint
+#         else:
+#             if initialization is not None:
+#                 init_model = {}
+#                 # Transpose weights
+#                 for param_name, param in torch.load(initialization).items():
+#                     init_model[param_name] = param
+#             else:
+#                 init_model = None
                 
         
-        final_model = conjugate_gradient_forward(
-            sum_fisher_matrices,
-            sum_fisher_times_weight,
-            init_model,
-            all_param_names,
-            num_iters
-        )
+#         final_model = conjugate_gradient_forward(
+#             sum_fisher_matrices,
+#             sum_fisher_times_weight,
+#             init_model,
+#             all_param_names,
+#             num_iters
+#         )
         
-        final_nonmerged_model = scale_and_sum(datasets_nonmerged_weights, 1 / len(datasets_nonmerged_weights))
+#         final_nonmerged_model = scale_and_sum(datasets_nonmerged_weights, 1 / len(datasets_nonmerged_weights))
         
-        for param_name, param in final_nonmerged_model.items():
-            final_model[param_name] = param
+#         for param_name, param in final_nonmerged_model.items():
+#             final_model[param_name] = param
             
-        torch.save(final_model, "final_model.pt")
+#         torch.save(final_model, "final_model.pt")
         
         
