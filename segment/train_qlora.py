@@ -47,7 +47,7 @@ if cluster == "narval":
     train_dataset = train_dataset.map(preprocess_instruct, batched=True)
     print(f"Training dataset set to: {dataset} from local path: {dataset_path}")
 
-lora_r = 16
+lora_r = 32
 lora_alpha = 16
 lora_dropout_factor = 0
 lora_dropout = lora_dropout_factor * 0.1
@@ -186,7 +186,7 @@ class SaveEpochCallback(TrainerCallback):
 
     def on_epoch_end(self, args, state, control, **kwargs):
         epoch = state.epoch
-        model_save_path = f"{self.save_path}_epoch_{epoch}"
+        model_save_path = f"{self.save_path}/epoch_{epoch}"
         kwargs['model'].save_pretrained(model_save_path)
         print(f"Model saved to {model_save_path} at the end of epoch {epoch}")
 

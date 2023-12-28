@@ -1,4 +1,5 @@
 import os
+import math
 import torch
 import torch.nn as nn
 
@@ -12,6 +13,7 @@ from transformers import (
     TrainingArguments,
     pipeline,
     logging,
+    TrainerCallback,
 )
 from peft import LoraConfig, PeftModel
 from trl import SFTTrainer
@@ -29,16 +31,23 @@ def preprocess_instruct(examples):
     texts = [prompt + " " + completion for prompt, completion in zip(examples['prompt'], examples['completion'])]
     return {'text': texts}
 
-cluster_strategy = "embeddings"
-num_clusters = 4  # Adjust the number of clusters as needed
-resume_from = 1 # zero-indexed, resume from last incomplete run
-resume_from_checkpoint = "/scratch/alif/language-models/segment/llama-2-7b-instruct_lora-att-d0-r64-a16-4_cluster_1/checkpoint-500"
-
 model_name = "meta-llama/Llama-2-7b-hf" # Also try "mistralai/Mistral-7B-v0.1"
 dataset = "instruct"
 cluster = "narval"
+
+num_clusters = 4  # Adjust the number of clusters as needed
+resume_from_cluster = 0 # zero-indexed, resume from last incomplete run
+resume_from_checkpoint = None
+cluster_strategy = "embeddings"
+
 attention_only = True
 layer_config = "att" if attention_only else "lin"
+
+# Based on experimentation, 32/16 seem to be the ideal rank/alpha settings for llama2 and open-instruct
+lora_r = 32 # Rank equal to alpha is equivalent to scaling weights by 1
+lora_alpha = 16 # Keep this fixed while changing the rank
+lora_dropout_factor = 0
+lora_dropout = lora_dropout_factor * 0.1
 
 if cluster == "cedar":
     if dataset == "guanaco":
@@ -56,12 +65,7 @@ if cluster == "narval":
     train_dataset = Dataset.from_file(dataset_path)
     train_dataset = train_dataset.map(preprocess_instruct, batched=True)
     print(f"Training dataset set to: {dataset} from local path: {dataset_path}")
-
-lora_r = 64 # Rank equal to alpha is equivalent to scaling weights by 1
-lora_alpha = 16 # Keep this fixed while changing the rank
-lora_dropout_factor = 0
-lora_dropout = lora_dropout_factor * 0.1
-
+    
 new_model = f"llama-2-7b-{dataset}-lora-{layer_config}-d{lora_dropout_factor}-r{lora_r}-a{lora_alpha}"
 
 use_4bit = True
@@ -71,7 +75,7 @@ use_nested_quant = False
 
 report_to = "wandb"
 output_dir = new_model
-num_train_epochs = 1
+num_train_epochs = 3
 fp16 = True
 bf16 = False
 per_device_train_batch_size = 8
@@ -138,6 +142,7 @@ tokenizer.padding_side = "right" # Fix weird overflow issue with fp16 training
 # https://github.com/huggingface/peft/blob/main/src/peft/utils/constants.py#L49
 # The QLoRA paper suggests that LoRA should be applied to all linear layers
 # https://github.com/huggingface/peft/issues/735
+# Empirically, this seems to harm performance. Need to re-run experiments and verify.
 
 if attention_only:
     print(f'Configuring LoRA to be applied to attention layers...')
@@ -216,12 +221,32 @@ for cluster_label in unique_clusters:
     cluster_df = clustered_data[clustered_data['cluster'] == cluster_label]
     cluster_datasets[f"cluster_{cluster_label}"] = Dataset.from_pandas(cluster_df)
     
+# Sort the cluster numerically
+cluster_datasets = dict(sorted(cluster_datasets.items()))  
 
+# Create custom checkpoint callbacks
+class PeftSavingCallback(TrainerCallback):
+    def on_save(self, args, state, control, **kwargs):
+        checkpoint_path = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        kwargs["model"].save_pretrained(checkpoint_path)
+
+        if "pytorch_model.bin" in os.listdir(checkpoint_path):
+            os.remove(os.path.join(checkpoint_path, "pytorch_model.bin"))
+
+class SaveEpochCallback(TrainerCallback):
+    def __init__(self, save_path):
+        self.save_path = save_path
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        epoch = state.epoch
+        model_save_path = f"{self.save_path}/epoch_{math.ceil(epoch)}"
+        kwargs['model'].save_pretrained(model_save_path)
+        print(f"Model saved to {model_save_path} at the end of epoch {epoch}")
+    
 count = 1
 total = len(cluster_datasets.items())
 
-for cluster_label, cluster_dataset in islice(cluster_datasets.items(), resume_from, total, 1):
-    
+for cluster_label, cluster_dataset in islice(cluster_datasets.items(), resume_from_cluster, total, 1):   
     
     # The QLoRA paper uses a batch size of 16 for a total of 1875 steps for Guanaco (~10K)
     # Which means the model sees 30K examples, or each example 3 times
@@ -229,15 +254,23 @@ for cluster_label, cluster_dataset in islice(cluster_datasets.items(), resume_fr
     dataset_iterations = 1
     cluster_size = len(cluster_dataset)
     cluster_max_steps = dataset_iterations * (cluster_size // per_device_train_batch_size)
-    print(f'{count}/{total} Training {cluster_label} for {cluster_max_steps} steps...')
-    
     new_model_name = f"llama-2-7b-{dataset}_lora-{layer_config}-d{lora_dropout_factor}-r{lora_r}-a{lora_alpha}-{num_clusters}_{cluster_label}"
     
+    # print(f'{count}/{total} Training {cluster_label} for {cluster_max_steps} steps...')
+    print(f'({count}/{total}) Training {new_model_name} for {num_train_epochs} epochs...')
+
+    # Initialize both callbacks
+    save_model_callback = SaveEpochCallback(new_model_name)
+    peft_saving_callback = PeftSavingCallback()
+    callbacks = [save_model_callback, peft_saving_callback]  
+    
     # Set training parameters
+    # Just going to train by epoch instead, easier for experimentation
     training_arguments = TrainingArguments(
         resume_from_checkpoint=resume_from_checkpoint,
         output_dir=new_model_name,
-        max_steps = cluster_max_steps, # Need to investigate how many steps or epochs to train for
+        num_train_epochs=num_train_epochs, # Compare results across epochs
+        # max_steps = cluster_max_steps, # Need to investigate how many steps or epochs to train for
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         optim=optim,
@@ -271,19 +304,17 @@ for cluster_label, cluster_dataset in islice(cluster_datasets.items(), resume_fr
         tokenizer=tokenizer,
         args=training_arguments,
         packing=packing,
+        callbacks=callbacks,
     )
 
     # Train the model for this cluster
     checkpoint = None
     if training_arguments.resume_from_checkpoint is not None:
         checkpoint = training_arguments.resume_from_checkpoint
-        
-    print(f'Resuming {cluster_label} model training from {resume_from_checkpoint}')
+        print(f'Resuming {cluster_label} model training from {resume_from_checkpoint}')
+    else:
+        print(f'Starting new training run for model: {new_model}')
     trainer.train(resume_from_checkpoint=checkpoint)
-
-    # Save the trained model
-    trainer.model.save_pretrained(new_model_name)
-    print(f'Saved {new_model_name}')
     count += 1
 
 
