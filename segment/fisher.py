@@ -15,6 +15,7 @@ from transformers import (
     TrainingArguments,
     pipeline,
     logging,
+    DataCollatorForLanguageModeling
 )
 from peft import LoraConfig, PeftModel
 
@@ -25,22 +26,42 @@ from transformers import DataCollatorWithPadding
 from torch.utils.data.distributed import DistributedSampler
 
 from tqdm import tqdm # for progress bar in loops
+from itertools import islice
 import numpy as np # for operations like norm and reshape in conjugate gradient
 
+
+# MODEL OPS & UTILS
+def normalize_metadata(stored_metadata, count):
+    normalized_metadata = {}
+    for parameter_name, parameter in stored_metadata.items():
+        normalized_metadata[parameter_name] = parameter / count
+    return normalized_metadata
+
+def detach_metadata(stored_metadata):
+    detached_metadata = {}
+    for parameter_name, parameter in stored_metadata.items():
+        detached_metadata[parameter_name] = parameter.detach().contiguous().cpu()
+    return detached_metadata
 
 # FISHER MERGING METHODS
 
 def compute_diag_fisher(model, param_regex):
     example_fisher = {}
     for param_name, param in model.named_parameters():
-        if (re.fullmatch(param_regex, param_name) and param.requires_grad):
-            if param_name not in example_fisher:
-                example_fisher[param_name] = torch.zeros_like(param.data)
-            example_fisher[param_name] += torch.square(param.grad)
+        if re.fullmatch(param_regex, param_name) and param.requires_grad:
+            # Ensure that the gradient computation is done on the CPU
+            grad = param.grad.cpu() if param.grad is not None else None
+            if grad is not None:
+                # Initialize the example_fisher entry on the CPU
+                if param_name not in example_fisher:
+                    example_fisher[param_name] = torch.zeros_like(param.data, device='cpu')
+                # Perform the square operation on CPU and accumulate
+                example_fisher[param_name] += torch.square(grad)
+
     return example_fisher
     
 
-def get_model_fisher(checkpoint_path, dataset, device, world_size, fisher_path):
+def get_model_fisher(checkpoint_path, dataset, tokenizer, device, world_size, fisher_path):
     
     model_name = "meta-llama/Llama-2-7b-hf"
     adapter_model = "llama-2-7b-guanaco_lora-att-d1-r64-a16-2_cluster_1/epoch_1/"
@@ -50,17 +71,32 @@ def get_model_fisher(checkpoint_path, dataset, device, world_size, fisher_path):
         model_name,
         low_cpu_mem_usage=True,
         return_dict=True,
-        torch_dtype=torch.float32,
+        torch_dtype=torch.float16,
         # device_map=device_map,
     )
     model = PeftModel.from_pretrained(base_model, adapter_model)
     model = model.merge_and_unload()
-
-    # Reload tokenizer to save it
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    # tokenizer.pad_token = tokenizer.eos_token
-    # tokenizer.padding_side = "right"
     
+    # Check if CUDA (GPU support) is available
+    if torch.cuda.is_available():
+        # Move the model to the GPU
+        model.cuda()
+        print("Model moved to GPU.")
+    else:
+        print("CUDA is not available, model will run on CPU.")
+        
+    for param in model.parameters():
+        param.requires_grad = True
+    
+    count = 0
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            print(f"Parameter {name} does not require grad.")
+            count += 1
+
+    if count == 0:
+        print("All parameters require grad.")
+        
     model.eval()
     stored_fisher = {}
     
@@ -71,46 +107,29 @@ def get_model_fisher(checkpoint_path, dataset, device, world_size, fisher_path):
             else:
                 stored_fisher[param_name] += value
     rank = 0
+    batch_size = 1 
     
-    iterator = get_epoch_batches(
-        dataset,
-        batch_size=1,
-        should_shuffle=True,
-        world_size=world_size,
-        rank=rank,
-        device=device,
-        tokenizer=tokenizer
-    )
+    dataloader = get_tokenized_dataloader(dataset, tokenizer, batch_size)
     
     num_samples = 0
     param_regex = ".*"
     
-    for batch in iterator:
-        inputs = tokenizer(batch, return_tensors='pt')
-        inputs['labels'] = inputs.input_ids[:, 1:].contiguous()
-        inputs.input_ids = inputs.input_ids[:, :-1].contiguous()
-    
-        
-        # Fisher is the gradient of the log likelihood (negative loss of log prob)
-        print(batch)
-        outputs = model(**inputs)
-        
-        # outputs = model(**batch)
+    print(f'Calculating losses for {adapter_model}...')
+    # Use islice to iterate over the first 1000 batches from the dataloader
+    for batch in tqdm(islice(dataloader, 1000), total=1000):
+        batch = {k: v.to(model.device) for k, v in batch.items()}
+        outputs = model(**batch)
         loss = outputs.loss
         log_prob = -loss
         log_prob.backward()
-        
+
         # Compute the per-example fisher and update total fisher
         with torch.no_grad():
             example_fisher = compute_diag_fisher(model, param_regex)
             update_fisher(example_fisher)
-        
+
         num_samples += 1
         model.zero_grad()
-        
-        # 1000 examples is sufficient
-        if num_samples >= 1000:
-            break
             
     with torch.no_grad():
         stored_fisher = normalize_metadata(stored_fisher, num_samples)
@@ -211,6 +230,7 @@ def _create_dataLoader(hf_dataset, batch_size, should_shuffle, world_size, rank,
     """
     Create a PyTorch DataLoader from a Hugging Face dataset.
     """
+    
     if is_distributedSetup(world_size):
         sampler = DistributedSampler(
             hf_dataset,
@@ -239,26 +259,38 @@ def _create_dataLoader(hf_dataset, batch_size, should_shuffle, world_size, rank,
 
         return None, data_loader
     
+def get_tokenized_dataloader(tokenized_dataset, tokenizer, batch_size):
+    # Instantiate a data collator for language modeling
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False  # Set to False for CLM
+    )
+
+    # Create a DataLoader for our training data
+    dataloader = DataLoader(
+        tokenized_dataset, 
+        batch_size=batch_size, 
+        collate_fn=data_collator  # Use the data collator as the collate_fn
+    )
+    
+    return dataloader
+    
 def get_epoch_batches(hf_dataset, batch_size, should_shuffle, world_size, rank, device, tokenizer):
     """
     Get batches of data for an epoch, moving each batch to the specified device after tokenization.
     """
-    # collate_fn = DataCollatorWithPadding(tokenizer=tokenizer)  # Use the tokenizer for padding
+    # Instantiate a data collator for language modeling
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False  # Set to False for CLM
+    )
     
     _, data_loader = _create_dataLoader(
-        hf_dataset, batch_size, should_shuffle, world_size, rank, 
-        # collate_fn
+        hf_dataset, batch_size, should_shuffle, world_size, rank, data_collator
     )
 
     for batch in data_loader:
-        # Tokenize the text strings in the batch
-#         inputs = tokenizer(batch['text'], return_tensors='pt', padding=True, truncation=True)
-#         inputs['labels'] = inputs.input_ids[:, 1:].contiguous()
-#         inputs.input_ids = inputs.input_ids[:, :-1].contiguous()
-        
-#         # Move the tokenized inputs to the specified device
-#         inputs = {k: v.to(device) for k, v in inputs.items()}
-        yield batch['text']
+        yield batch
         
 
 # MODEL OPERATIONS
@@ -309,6 +341,29 @@ def preprocess_instruct(examples):
     texts = [prompt + " " + completion for prompt, completion in zip(examples['prompt'], examples['completion'])]
     return {'text': texts}
 
+# Remove 'prompt' and 'completion' keys from the dataset
+def remove_unnecessary_columns(example):
+    return {
+        "input_ids": example["input_ids"],
+        "attention_mask": example["attention_mask"]
+    }
+
+def shift_labels_to_the_right(examples):
+    examples['labels'] = examples['input_ids'].copy()
+    examples['labels'] = [x[1:] + [-100] for x in examples['labels']]
+    return examples
+
+# Tokenize the dataset
+def tokenize_function(example):
+    return tokenizer(
+        example["prompt"],
+        example["completion"],
+        truncation=True,       # truncate to the model's max length
+        max_length=128,        # max length for the tokens
+        padding="max_length",  # add padding to the tokens
+        return_tensors="pt"    # return PyTorch tensors
+    )
+
 
 
 if __name__ == "__main__":
@@ -337,7 +392,21 @@ if __name__ == "__main__":
         train_dataset = Dataset.from_file(dataset_path)
         train_dataset = train_dataset.map(preprocess_instruct, batched=True)
         print(f"Training dataset set to: {dataset} from local path: {dataset_path}")
+        
+    model_name = "meta-llama/Llama-2-7b-hf"
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
     
+    # Pre-process and tokenize dataset for loss calculations
+    tokenized_dataset = train_dataset.map(tokenize_function, batched=True)
+    tokenized_dataset = tokenized_dataset.map(remove_unnecessary_columns, batched=True)
+    tokenized_dataset = tokenized_dataset.map(
+        lambda examples: {'input_ids': examples['input_ids'], 'attention_mask': examples['attention_mask']},
+        batched=True,
+        remove_columns=tokenized_dataset.column_names  # This removes all columns except the ones specified above
+    )
+    tokenized_dataset = tokenized_dataset.map(shift_labels_to_the_right, batched=True)
     
     # model_config, data_config, eval_config = args
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -349,11 +418,12 @@ if __name__ == "__main__":
     checkpoint_dict = load_checkpoints(pretrained_model, num_clusters, torch.device("cpu"))
     
     for model_folder in checkpoint_dict.keys():
+        print(f'Calculating fisher for {model_folder}...')
         fisher_name = f"{model_folder}_fisher.pt"
         fisher_path = os.path.join('fishers/', fisher_name)
         # model = load_file(checkpoint_dict[model_folder])
         checkpoint_path = checkpoint_dict[model_folder]
-        get_model_fisher(checkpoint_path, train_dataset, device, world_size, fisher_path)
+        get_model_fisher(checkpoint_path, tokenized_dataset, tokenizer, device, world_size, fisher_path)
         print(f'Saved fisher for {model_folder} at {fisher_path}')
         
         
