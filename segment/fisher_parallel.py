@@ -173,7 +173,7 @@ def get_tokenized_dataloader(tokenized_dataset, tokenizer, batch_size):
     
     return dataloader
 
-def load_checkpoints(pretrained_model, num_clusters, device):
+def load_checkpoints(pretrained_model, num_clusters, device, target_epoch=None):
     """
     Load model cluster checkpoints to merge.
     """
@@ -190,7 +190,9 @@ def load_checkpoints(pretrained_model, num_clusters, device):
             raise FileNotFoundError(f"No epochs found in {cluster_path}")
 
         latest_epoch = sorted(epochs, key=lambda x: int(x.split('_')[1]), reverse=True)[0]
-        checkpoint_file = os.path.join(cluster_path, latest_epoch, 'model/')
+        epoch = latest_epoch if target_epoch is None else target_epoch
+        
+        checkpoint_file = os.path.join(cluster_path, epoch, 'model/')
         checkpoint_dict[cluster_name] = checkpoint_file
 
     return checkpoint_dict
@@ -362,9 +364,9 @@ if __name__ == "__main__":
     
     dataset = "instruct"
     cluster = "cedar"
-    compute_fishers = False
     
-    model_lambda_factor = 8
+    compute_fishers = False
+    model_lambda_factor = 9
     model_lambda = 0.1 * model_lambda_factor
 
     if cluster == "cedar":
@@ -401,9 +403,9 @@ if __name__ == "__main__":
     tokenized_dataset = tokenized_dataset.map(shift_labels_to_the_right, batched=True)
     
     # Load checkpoints
-    pretrained_model = "llama-2-7b-guanaco_lora-att-d1-r64-a16-2"
+    pretrained_model = "llama-2-7b-instruct_lora-att-d0-r32-a16-2"
     num_clusters = 2
-    checkpoint_dict = load_checkpoints(pretrained_model, num_clusters, torch.device("cpu"))
+    checkpoint_dict = load_checkpoints(pretrained_model, num_clusters, torch.device("cpu"), target_epoch='epoch_1')
     
     if compute_fishers:
         for model_folder in checkpoint_dict.keys():
