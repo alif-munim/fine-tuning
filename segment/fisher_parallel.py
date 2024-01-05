@@ -43,6 +43,24 @@ def detach_metadata(stored_metadata):
         detached_metadata[parameter_name] = parameter.detach().contiguous().cpu()
     return detached_metadata
 
+def set_minimum(model_parameters, epsilon):
+    """
+    Set the minimum of the parameters to be epsilon. For any value less than epsilon,
+    replace with epsilon
+
+    Args:
+        model_parameters:
+
+    Returns:
+
+    """
+    new_modelParameters = {}
+    for parameter_name, parameter in model_parameters.items():
+        new_parameter = parameter.clone()
+        new_parameter[new_parameter < epsilon] = epsilon
+        new_modelParameters[parameter_name] = new_parameter
+    return new_modelParameters
+
 # FISHER MERGING METHODS
 
 def compute_diag_fisher(model, param_regex):
@@ -181,7 +199,7 @@ def get_cluster(checkpoint):
     pattern = re.compile(r"cluster_\d+")
     
     # Find all matches of the pattern in the checkpoint path
-    matches = pattern.findall(checkpoint_path)
+    matches = pattern.findall(checkpoint)
     
     # Return the last occurrence of the cluster pattern
     return matches[-1] if matches else None
@@ -318,6 +336,8 @@ if __name__ == "__main__":
     
     dataset = "instruct"
     cluster = "cedar"
+    compute_fishers = False
+    model_lambda = 0.5
 
     if cluster == "cedar":
         if dataset == "guanaco":
@@ -359,43 +379,64 @@ if __name__ == "__main__":
     num_clusters = 2
     checkpoint_dict = load_checkpoints(pretrained_model, num_clusters, torch.device("cpu"))
     
-    for model_folder in checkpoint_dict.keys():
-        print(f'Calculating fisher for {model_folder}...')
-        fisher_name = f"{model_folder}_fisher.pt"
-        fisher_path = os.path.join('fishers/', fisher_name)
-        # model = load_file(checkpoint_dict[model_folder])
-        checkpoint_path = checkpoint_dict[model_folder]
-        get_model_fisher(checkpoint_path, tokenized_dataset, tokenizer, fisher_path)
-        print(f'Saved fisher for {model_folder} at {fisher_path}')
+    if compute_fishers:
+        for model_folder in checkpoint_dict.keys():
+            print(f'Calculating fisher for {model_folder}...')
+            fisher_name = f"{model_folder}_fisher.pt"
+            fisher_path = os.path.join('fishers/', fisher_name)
+            # model = load_file(checkpoint_dict[model_folder])
+            checkpoint_path = checkpoint_dict[model_folder]
+            get_model_fisher(checkpoint_path, tokenized_dataset, tokenizer, fisher_path)
+            print(f'Saved fisher for {model_folder} at {fisher_path}')
         
         
     # MERGE FISHERS
     # https://github.com/r-three/mats/blob/main/src/merging/diagonal_fisherMerging.py
     
     # Load fishers
+    print(f"Beginning model merging process...")
+    
     loaded_fishers = {}
     for model_folder in checkpoint_dict.keys():
-        fisher_path = f"{model_folder}_fisher.pt"
+        fisher_name = f"{model_folder}_fisher.pt"
+        fisher_path = os.path.join('fishers/', fisher_name)
         fisher = torch.load(fisher_path, torch.device("cpu"))
         loaded_fishers[model_folder] = fisher
+        print(f'Loaded fisher for {model_folder}!')
+    print(f"keys for loaded_fishers: {loaded_fishers.keys()}")
     
     checkpoint_fisher_matrices = {}
     
     # The original implementation merges checkpoints by dataset
     # For adapters, merge checkpoints by cluster
-    for model_folder, checkpoint_path in loaded_checkpoints.items():
-        cluster = get_cluster(checkpoint_path)
+    cluster_keys = []
+    
+    for model_folder, checkpoint_path in checkpoint_dict.items():
+        cluster = get_cluster(model_folder)
+        cluster_keys.append(cluster)
+        print(f"Adding checkpoint path for {model_folder} and {cluster}")
         checkpoint_fisher_matrices[cluster] = {"checkpoint": checkpoint_path}
         
     for model_folder, loaded_fisher in loaded_fishers.items():
         cluster = get_cluster(model_folder)
-        checkpoint_fisher_matrices[cluster].update({"fisher": fisher})
-    
+        if cluster not in checkpoint_fisher_matrices:
+            raise ValueError(f"Cluster key {cluster} not found in checkpoint_fisher_matrices")
+        checkpoint_fisher_matrices[cluster].update({"fisher": loaded_fisher})
+        
+    for cluster in cluster_keys:
+        print(f"keys for checkpoint_fisher_matrices['{cluster}']: {checkpoint_fisher_matrices[cluster].keys()}")
     
     weighted_checkpoint_list = []
     fisher_list = []
     
+    for cluster in cluster_keys:
+        if 'checkpoint' not in checkpoint_fisher_matrices[cluster] or 'fisher' not in checkpoint_fisher_matrices[cluster]:
+            raise KeyError(f"Missing 'checkpoint' or 'fisher' key for cluster {cluster}")
+    
     for cluster, checkpoint_fisher_matrix in checkpoint_fisher_matrices.items():
+        print(f"cluster name: {cluster}")
+        print(f"matrix keys: {checkpoint_fisher_matrix.keys()}")
+        
         checkpoint_path = checkpoint_fisher_matrix["checkpoint"]
         checkpoint = load_file(checkpoint_path)
         print(f'Loaded checkpoint for {cluster}')
@@ -405,7 +446,7 @@ if __name__ == "__main__":
         print(f'Loaded fisher for {cluster}')
         
         # Scale fishers
-        if len(loaded_checkpoints) == 2:
+        if len(checkpoint_dict) == 2:
             if len(fisher_list) == 0:
                 fisher = scale(fisher, model_lambda)
             else:
