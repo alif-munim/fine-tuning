@@ -4,8 +4,11 @@
 import os
 import re
 from scipy.sparse.linalg import LinearOperator, cg # for conjugate gradient methods
+
 from safetensors import safe_open # for checkpoint loading
 from safetensors.torch import load_model, save_model, load_file
+from safetensors.torch import load as load_safetensors
+
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
@@ -25,41 +28,9 @@ from torch.utils.data import DataLoader
 from transformers import DataCollatorWithPadding
 from torch.utils.data.distributed import DistributedSampler
 
-from tqdm import tqdm # for progress bar in loops
+from tqdm import tqdm 
 from itertools import islice
-import numpy as np # for operations like norm and reshape in conjugate gradient
-
-
-# MODEL OPS & UTILS
-def normalize_metadata(stored_metadata, count):
-    normalized_metadata = {}
-    for parameter_name, parameter in stored_metadata.items():
-        normalized_metadata[parameter_name] = parameter / count
-    return normalized_metadata
-
-def detach_metadata(stored_metadata):
-    detached_metadata = {}
-    for parameter_name, parameter in stored_metadata.items():
-        detached_metadata[parameter_name] = parameter.detach().contiguous().cpu()
-    return detached_metadata
-
-def set_minimum(model_parameters, epsilon):
-    """
-    Set the minimum of the parameters to be epsilon. For any value less than epsilon,
-    replace with epsilon
-
-    Args:
-        model_parameters:
-
-    Returns:
-
-    """
-    new_modelParameters = {}
-    for parameter_name, parameter in model_parameters.items():
-        new_parameter = parameter.clone()
-        new_parameter[new_parameter < epsilon] = epsilon
-        new_modelParameters[parameter_name] = new_parameter
-    return new_modelParameters
+import numpy as np
 
 # FISHER MERGING METHODS
 
@@ -81,32 +52,33 @@ def compute_diag_fisher(model, param_regex):
     
 
 def get_model_fisher(checkpoint_path, dataset, tokenizer, fisher_path):
-    
-    model_name = "meta-llama/Llama-2-7b-hf"
-    adapter_model = "llama-2-7b-guanaco_lora-att-d1-r64-a16-2_cluster_1/epoch_1/"
 
-    # Reload model in FP16 and merge it with LoRA weights
-    base_model = AutoModelForCausalLM.from_pretrained(
-        model_name,
+    model = AutoModelForCausalLM.from_pretrained(
+        checkpoint_path,
         low_cpu_mem_usage=True,
         return_dict=True,
         torch_dtype=torch.float16,
         device_map="auto", # Parallelize across GPUs
     )
-    model = PeftModel.from_pretrained(base_model, adapter_model)
-    model = model.merge_and_unload()
+
         
     for param in model.parameters():
         param.requires_grad = True
     
-    count = 0
+    req_grad_count = 0
+    lora_count = 0
     for name, param in model.named_parameters():
         if not param.requires_grad:
             print(f"Parameter {name} does not require grad.")
-            count += 1
-
-    if count == 0:
-        print("All parameters require grad.")
+            req_grad_count += 1
+        if 'lora' in name:
+            print(f"Parameter {name} is a LoRA parameter.")
+            lora_count += 1
+            
+    if req_grad_count == 0:
+        print("All parameters require grad.")        
+    if lora_count == 0:
+        print("All LoRA parameters have been merged.")
         
     model.eval()
     stored_fisher = {}
@@ -125,14 +97,9 @@ def get_model_fisher(checkpoint_path, dataset, tokenizer, fisher_path):
     num_samples = 0
     param_regex = ".*"
     
-    print(f'Calculating losses for {adapter_model}...')
-    # Use islice to iterate over the first 1000 batches from the dataloader
+    print(f'Calculating losses for {checkpoint_path}...')
     for batch in tqdm(islice(dataloader, 1000), total=1000):
-        # batch = {k: v.to(model.device) for k, v in batch.items()}
         batch = {k: v.to("cuda") for k, v in batch.items()}
-        
-        # for k, v in batch.items():
-        #     print(f"key: {k} | value: {v} | v device: {v.device} | model device: {model.device}")
         
         outputs = model(**batch)
         loss = outputs.loss
@@ -189,31 +156,26 @@ def conjugate_gradient_forward(
         
         return final_model
     
-    
 
     
 # DATASET AND CHECKPOINT LOADING
+
+def get_tokenized_dataloader(tokenized_dataset, tokenizer, batch_size):
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False  # Set to False for CLM
+    )
+    dataloader = DataLoader(
+        tokenized_dataset, 
+        batch_size=batch_size, 
+        collate_fn=data_collator 
+    )
     
-def get_cluster(checkpoint):
-    # Define a regular expression pattern to capture the cluster name
-    pattern = re.compile(r"cluster_\d+")
-    
-    # Find all matches of the pattern in the checkpoint path
-    matches = pattern.findall(checkpoint)
-    
-    # Return the last occurrence of the cluster pattern
-    return matches[-1] if matches else None
+    return dataloader
 
 def load_checkpoints(pretrained_model, num_clusters, device):
     """
-    Load model (adapter) checkpoints to merge.
-
-    Args:
-        pretrained_model: name of the base model (e.g. llama-2-7b)
-        num_clusters: number of dataset clusters to retrieve adapter checkpoints
-        device: device to load checkpoints onto (e.g. cpu or cuda)
-    Return:
-        checkpoint_dict: a dictionary with checkpoint folder names as keys and full checkpoint file paths as values
+    Load model cluster checkpoints to merge.
     """
 
     checkpoint_dict = {}
@@ -223,37 +185,68 @@ def load_checkpoints(pretrained_model, num_clusters, device):
         cluster_name = f"{pretrained_model}_cluster_{cluster_idx}"
         cluster_path = os.path.join(base_path, cluster_name)
 
-        # Now we need to find the latest epoch in this cluster
         epochs = [d for d in os.listdir(cluster_path) if d.startswith('epoch')]
         if not epochs:
             raise FileNotFoundError(f"No epochs found in {cluster_path}")
 
         latest_epoch = sorted(epochs, key=lambda x: int(x.split('_')[1]), reverse=True)[0]
-        checkpoint_file = os.path.join(cluster_path, latest_epoch, "adapter_model.safetensors")
-
-        if not os.path.isfile(checkpoint_file):
-            raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_file}")
-
-        # Map the cluster folder name to the full path of the checkpoint file
+        checkpoint_file = os.path.join(cluster_path, latest_epoch, 'model/')
         checkpoint_dict[cluster_name] = checkpoint_file
 
     return checkpoint_dict
-    
-def get_tokenized_dataloader(tokenized_dataset, tokenizer, batch_size):
-    # Instantiate a data collator for language modeling
-    data_collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False  # Set to False for CLM
-    )
 
-    # Create a DataLoader for our training data
-    dataloader = DataLoader(
-        tokenized_dataset, 
-        batch_size=batch_size, 
-        collate_fn=data_collator  # Use the data collator as the collate_fn
-    )
-    
-    return dataloader
+def combine_safetensors(file_paths):
+    """
+    Load multiple SafeTensor files and combine their state dictionaries.
+    """
+    combined_state_dict = {}
+
+    for file_path in file_paths:
+        # Load the state dict from the current SafeTensor file
+        with open(file_path, "rb") as f:
+            data = f.read()
+        f.close()
+            
+        state_dict = load_safetensors(data)
+
+        # Check for key conflicts before updating
+        intersecting_keys = combined_state_dict.keys() & state_dict.keys()
+        if intersecting_keys:
+            raise ValueError(f"Conflicting keys found when loading {file_path}: {intersecting_keys}")
+
+        # Update the combined state dictionary
+        combined_state_dict.update(state_dict)
+
+    return combined_state_dict
+
+
+# REGEX FUNCTIONS
+
+def get_cluster(checkpoint):
+    pattern = re.compile(r"cluster_\d+")
+    matches = pattern.findall(checkpoint)
+    return matches[-1] if matches else None
+
+def get_model_safetensors(directory):
+    pattern = re.compile(r'model-\d+-of-\d+\.safetensors$')
+    model_files = []
+    for filename in os.listdir(directory):
+        if pattern.match(filename) and not filename.startswith('adapter_model'):
+            model_files.append(os.path.join(directory, filename))
+
+    model_files.sort()
+    print(model_files)
+
+    return model_files
+
+def extract_epoch(checkpoint_path):
+    epoch_regex = re.compile(r'epoch_(\d+)')
+    match = epoch_regex.search(checkpoint_path)
+    if match:
+        return int(match.group(1))
+    else:
+        return None    
+
         
 
 # MODEL OPERATIONS
@@ -264,6 +257,11 @@ def map_params(model_params, map_fn):
         new_params[param_name] = map_fn(param_value)
     return new_params
 
+def scale(model_params, scaler):
+    scale_fn = lambda x: x * scaler
+    scaled_model = map_params(model_params, scale_fn)
+    return scaled_model
+
 def reduce_params(model_params, reduce_fn):
     param_values = zip(*list(map(lambda x: x.values(), model_params)))
     param_names = model_params[0].keys()
@@ -273,21 +271,18 @@ def reduce_params(model_params, reduce_fn):
         new_params[param_name] = reduce_fn(torch.stack(list(param_value), dim=0))
     return new_params
 
-def scale(model_params, scaler):
-    scale_fn = lambda x: x * scaler
-    scaled_model = map_params(model_params, scale_fn)
-    return scaled_model
-
 def scale_and_sum(model_params, model_lambda):
     sum_fn = lambda parameters: torch.sum(parameters * model_lambda, dim=0)
     summed_model = reduce_params(model_params, sum_fn)
     return summed_model
 
 def pairwise_param_map(params_a, params_b, map_fn):
-    all_params = params_a.keys()
+    a_params = params_a.keys()
+    b_params = params_b.keys()
+    
     new_params = {}
     
-    for param_name in all_params:
+    for param_name in a_params:
         new_params[param_name] = map_fn(params_a[param_name], params_b[param_name])
     return new_params
 
@@ -296,8 +291,39 @@ def element_wise_multiply(params_a, params_b):
     element_wise_mul_model = pairwise_param_map(params_a, params_b, element_wise_mul)
     return element_wise_mul_model
 
+def divide(params_a, params_b):
+    divide_fn = lambda x, y: x / y
+    divide_model = pairwise_param_map(
+        params_a, params_b, divide_fn
+    )
+    return divide_model
 
-# HF Functions
+def set_minimum(model_parameters, epsilon):
+    """
+    Set the minimum of the parameters to be epsilon. For any value less than epsilon,
+    replace with epsilon
+    """
+    new_modelParameters = {}
+    for parameter_name, parameter in model_parameters.items():
+        new_parameter = parameter.clone()
+        new_parameter[new_parameter < epsilon] = epsilon
+        new_modelParameters[parameter_name] = new_parameter
+    return new_modelParameters
+
+def normalize_metadata(stored_metadata, count):
+    normalized_metadata = {}
+    for parameter_name, parameter in stored_metadata.items():
+        normalized_metadata[parameter_name] = parameter / count
+    return normalized_metadata
+
+def detach_metadata(stored_metadata):
+    detached_metadata = {}
+    for parameter_name, parameter in stored_metadata.items():
+        detached_metadata[parameter_name] = parameter.detach().contiguous().cpu()
+    return detached_metadata
+
+
+# HUGGING FACE DATA PRE-PROCESSING
 
 def preprocess_instruct(examples):
     # Concatenate 'prompt' and 'completion' fields
@@ -337,7 +363,9 @@ if __name__ == "__main__":
     dataset = "instruct"
     cluster = "cedar"
     compute_fishers = False
-    model_lambda = 0.5
+    
+    model_lambda_factor = 8
+    model_lambda = 0.1 * model_lambda_factor
 
     if cluster == "cedar":
         if dataset == "guanaco":
@@ -372,8 +400,6 @@ if __name__ == "__main__":
     )
     tokenized_dataset = tokenized_dataset.map(shift_labels_to_the_right, batched=True)
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
     # Load checkpoints
     pretrained_model = "llama-2-7b-guanaco_lora-att-d1-r64-a16-2"
     num_clusters = 2
@@ -394,7 +420,7 @@ if __name__ == "__main__":
     # https://github.com/r-three/mats/blob/main/src/merging/diagonal_fisherMerging.py
     
     # Load fishers
-    print(f"Beginning model merging process...")
+    print(f"Beginning model merging process with model lambda {model_lambda}...")
     
     loaded_fishers = {}
     for model_folder in checkpoint_dict.keys():
@@ -412,9 +438,10 @@ if __name__ == "__main__":
     cluster_keys = []
     
     for model_folder, checkpoint_path in checkpoint_dict.items():
+        epoch_num = extract_epoch(checkpoint_path)
         cluster = get_cluster(model_folder)
         cluster_keys.append(cluster)
-        print(f"Adding checkpoint path for {model_folder} and {cluster}")
+        print(f"Adding checkpoint path for {model_folder} and {cluster}: {checkpoint_path}")
         checkpoint_fisher_matrices[cluster] = {"checkpoint": checkpoint_path}
         
     for model_folder, loaded_fisher in loaded_fishers.items():
@@ -422,9 +449,6 @@ if __name__ == "__main__":
         if cluster not in checkpoint_fisher_matrices:
             raise ValueError(f"Cluster key {cluster} not found in checkpoint_fisher_matrices")
         checkpoint_fisher_matrices[cluster].update({"fisher": loaded_fisher})
-        
-    for cluster in cluster_keys:
-        print(f"keys for checkpoint_fisher_matrices['{cluster}']: {checkpoint_fisher_matrices[cluster].keys()}")
     
     weighted_checkpoint_list = []
     fisher_list = []
@@ -438,7 +462,15 @@ if __name__ == "__main__":
         print(f"matrix keys: {checkpoint_fisher_matrix.keys()}")
         
         checkpoint_path = checkpoint_fisher_matrix["checkpoint"]
-        checkpoint = load_file(checkpoint_path)
+        checkpoint_model = AutoModelForCausalLM.from_pretrained(
+            checkpoint_path,
+            low_cpu_mem_usage=True,
+            return_dict=True,
+            torch_dtype=torch.float16,
+        )
+        checkpoint = checkpoint_model.state_dict()
+        checkpoint = {key: value.to('cpu') for key, value in checkpoint.items()}
+        
         print(f'Loaded checkpoint for {cluster}')
 
         fisher = checkpoint_fisher_matrix["fisher"]
@@ -465,6 +497,7 @@ if __name__ == "__main__":
         scale_and_sum(fisher_list, 1)
     )
     
-    merged_path = os.path.join('merged_models/', 'merged_model.pt')
+    merged_filename = pretrained_model + '-merged-ep' + str(epoch_num) + '-ml' + str(model_lambda_factor) + '.pt'
+    merged_path = os.path.join('merged_models/', merged_filename)
     torch.save(merged_model, merged_path)
     print(f'Merged models and saved to {merged_path}')

@@ -13,4 +13,4 @@ lm_cache/
 mats/
 *.npy
 segment/segment.ipynb
-segment/test.py
+segment/test
