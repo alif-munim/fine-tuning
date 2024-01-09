@@ -15,15 +15,17 @@ from transformers import (
 from peft import LoraConfig, PeftModel
 from trl import SFTTrainer
 
-model_name = "meta-llama/Llama-2-7b-hf"
-new_model = "llama-2-7b-guanaco_lora-att-d1-r64-a16-2-merged-ep1-ml5"
 push_to_hub = False
+model_name = "meta-llama/Llama-2-7b-hf"
 
 save_adapter = False
-adapter_model = "llama-2-7b-guanaco_lora-att-d1-r64-a16-2_cluster_1/epoch_1"
+# adapter_model = "llama-2-7b-instruct_lora-att-d0-r64-a16-2_cluster_1/epoch_1"
+# new_model = "llama-2-7b-instruct_lora-att-d0-r64-a16-2_cluster_1/epoch_1/model"
 
 save_merged = True
-merged_checkpoint = "merged_models/llama-2-7b-guanaco_lora-att-d1-r64-a16-2-merged.pt"
+merged_checkpoint = "merged_models/llama-2-7b-instruct_lora-att-d0-r64-a16-2-merged-ep1-ml9.pt"
+new_model = "llama-2-7b-instruct_lora-att-d0-r64-a16-2-merged-ep1-ml9"
+
 
 
 if save_adapter:

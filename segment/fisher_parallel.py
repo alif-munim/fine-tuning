@@ -31,9 +31,10 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm 
 from itertools import islice
 import numpy as np
+from functools import partial
 
 # FISHER MERGING METHODS
-
+    
 def compute_diag_fisher(model, param_regex):
     example_fisher = {}
     for param_name, param in model.named_parameters():
@@ -45,22 +46,18 @@ def compute_diag_fisher(model, param_regex):
                 # Initialize the example_fisher entry on the CPU
                 if param_name not in example_fisher:
                     example_fisher[param_name] = torch.zeros_like(param.data)
+                    # print(f"Adding parameter {param_name} to fisher matrix")
+                    # print(f"example_fisher keys: {example_fisher.keys()}")
                 # Perform the square operation on CPU and accumulate
                 example_fisher[param_name] += torch.square(grad)
 
+    # print(f"example_fisher keys: {example_fisher.keys()}")
     return example_fisher
     
 
-def get_model_fisher(checkpoint_path, dataset, tokenizer, fisher_path):
+def get_model_fisher(pretrained_model, checkpoint_path, dataset, tokenizer, fisher_path):
 
-    model = AutoModelForCausalLM.from_pretrained(
-        checkpoint_path,
-        low_cpu_mem_usage=True,
-        return_dict=True,
-        torch_dtype=torch.float16,
-        device_map="auto", # Parallelize across GPUs
-    )
-
+    model = load_peft_model(pretrained_model, checkpoint_path)
         
     for param in model.parameters():
         param.requires_grad = True
@@ -103,6 +100,8 @@ def get_model_fisher(checkpoint_path, dataset, tokenizer, fisher_path):
         
         outputs = model(**batch)
         loss = outputs.loss
+        
+        # Fisher is the gradient of the log likelihood (which is the negative loss of the log prob)
         log_prob = -loss
         log_prob.backward()
 
@@ -116,6 +115,9 @@ def get_model_fisher(checkpoint_path, dataset, tokenizer, fisher_path):
             
     with torch.no_grad():
         stored_fisher = normalize_metadata(stored_fisher, num_samples)
+        
+    for param_name, param in model.named_parameters():
+        print(f"mean value of {param_name}: {torch.mean(stored_fisher[param_name])}")
         
     torch.save(detach_metadata(stored_fisher), fisher_path)
     
@@ -160,6 +162,17 @@ def conjugate_gradient_forward(
     
 # DATASET AND CHECKPOINT LOADING
 
+def load_peft_model(base_model, adapter_model):
+    base_model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        low_cpu_mem_usage=True,
+        return_dict=True,
+        torch_dtype=torch.float16,
+        device_map="auto", # Parallelize across GPUs
+    )
+    model = PeftModel.from_pretrained(base_model, adapter_model)
+    return model
+
 def get_tokenized_dataloader(tokenized_dataset, tokenizer, batch_size):
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
@@ -192,34 +205,37 @@ def load_checkpoints(pretrained_model, num_clusters, device, target_epoch=None):
         latest_epoch = sorted(epochs, key=lambda x: int(x.split('_')[1]), reverse=True)[0]
         epoch = latest_epoch if target_epoch is None else target_epoch
         
-        checkpoint_file = os.path.join(cluster_path, epoch, 'model/')
+        checkpoint_file = os.path.join(cluster_path, 
+                                       epoch, 
+                                       # 'model/'
+                                      )
         checkpoint_dict[cluster_name] = checkpoint_file
 
     return checkpoint_dict
 
-def combine_safetensors(file_paths):
-    """
-    Load multiple SafeTensor files and combine their state dictionaries.
-    """
-    combined_state_dict = {}
+# def combine_safetensors(file_paths):
+#     """
+#     Load multiple SafeTensor files and combine their state dictionaries.
+#     """
+#     combined_state_dict = {}
 
-    for file_path in file_paths:
-        # Load the state dict from the current SafeTensor file
-        with open(file_path, "rb") as f:
-            data = f.read()
-        f.close()
+#     for file_path in file_paths:
+#         # Load the state dict from the current SafeTensor file
+#         with open(file_path, "rb") as f:
+#             data = f.read()
+#         f.close()
             
-        state_dict = load_safetensors(data)
+#         state_dict = load_safetensors(data)
 
-        # Check for key conflicts before updating
-        intersecting_keys = combined_state_dict.keys() & state_dict.keys()
-        if intersecting_keys:
-            raise ValueError(f"Conflicting keys found when loading {file_path}: {intersecting_keys}")
+#         # Check for key conflicts before updating
+#         intersecting_keys = combined_state_dict.keys() & state_dict.keys()
+#         if intersecting_keys:
+#             raise ValueError(f"Conflicting keys found when loading {file_path}: {intersecting_keys}")
 
-        # Update the combined state dictionary
-        combined_state_dict.update(state_dict)
+#         # Update the combined state dictionary
+#         combined_state_dict.update(state_dict)
 
-    return combined_state_dict
+#     return combined_state_dict
 
 
 # REGEX FUNCTIONS
@@ -229,76 +245,107 @@ def get_cluster(checkpoint):
     matches = pattern.findall(checkpoint)
     return matches[-1] if matches else None
 
-def get_model_safetensors(directory):
-    pattern = re.compile(r'model-\d+-of-\d+\.safetensors$')
-    model_files = []
-    for filename in os.listdir(directory):
-        if pattern.match(filename) and not filename.startswith('adapter_model'):
-            model_files.append(os.path.join(directory, filename))
+# def get_model_safetensors(directory):
+#     pattern = re.compile(r'model-\d+-of-\d+\.safetensors$')
+#     model_files = []
+#     for filename in os.listdir(directory):
+#         if pattern.match(filename) and not filename.startswith('adapter_model'):
+#             model_files.append(os.path.join(directory, filename))
 
-    model_files.sort()
-    print(model_files)
+#     model_files.sort()
+#     print(model_files)
 
-    return model_files
-
-def extract_epoch(checkpoint_path):
-    epoch_regex = re.compile(r'epoch_(\d+)')
-    match = epoch_regex.search(checkpoint_path)
-    if match:
-        return int(match.group(1))
-    else:
-        return None    
+#     return model_files  
 
         
 
 # MODEL OPERATIONS
 
-def map_params(model_params, map_fn):
+def debug_params(model_label, model_params, verbose=False):
+    bug_counter = 0
+    nan_params = []
+    non_tensor_params = []
+    for param_name, param_value in model_params.items():
+        if isinstance(param_value, tuple):
+            if verbose print(f"WARNING: Tuple found in {model_label} in parameter: {param_name}")
+            if verbose print(param_value)
+            bug_counter += 1
+            non_tensor_params.append(param_name)
+        elif not isinstance(param_value, torch.Tensor):
+            if verbose print(f"WARNING: Non-tensor found in {model_label} in parameter: {param_name}: {type(param_value)}")
+            bug_counter += 1
+            non_tensor_params.append(param_name)
+        elif torch.isnan(param_value).any():
+            if verbose print(f"WARNING: parameter {param_name} contains NaN")
+            bug_counter += 1
+            nan_params.append(param_name)
+    
+    if bug_counter == 0:
+        print(f"SUCCESS: {model_label} contains no NaN or non-tensor parameter values")
+    else:
+        if len(nan_params) > 0:
+            print(f"WARNING: Non-tensor found in {model_label} in parameters: \n{nan_params[:10]})
+        elif len(non_tensor_params) > 0:
+            print(f"WARNING: Tuple found in {model_label} in parameters: {non_tensor_params[:10]}")
+            
+
+def map_params(model_params, map_fn, select):
     new_params = {}
     for param_name, param_value in model_params.items():
-        new_params[param_name] = map_fn(param_value)
+        if select is not None and select in param_name:
+            new_params[param_name] = map_fn(param_value)
+        else:
+            new_params[param_name] = param_value
     return new_params
 
-def scale(model_params, scaler):
+def scale(model_params, scaler, select):
     scale_fn = lambda x: x * scaler
-    scaled_model = map_params(model_params, scale_fn)
+    scaled_model = map_params(model_params, scale_fn, select)
     return scaled_model
 
-def reduce_params(model_params, reduce_fn):
+def reduce_params(model_params, reduce_fn, select):
     param_values = zip(*list(map(lambda x: x.values(), model_params)))
     param_names = model_params[0].keys()
     
     new_params = {}
     for param_name, param_value in zip(*[param_names, param_values]):
-        new_params[param_name] = reduce_fn(torch.stack(list(param_value), dim=0))
+        if select is not None and select in param_name:
+            new_params[param_name] = reduce_fn(torch.stack(list(param_value), dim=0))
+        else:
+            new_params[param_name] = param_value
     return new_params
 
-def scale_and_sum(model_params, model_lambda):
+def scale_and_sum(model_params, model_lambda, select):
     sum_fn = lambda parameters: torch.sum(parameters * model_lambda, dim=0)
-    summed_model = reduce_params(model_params, sum_fn)
+    summed_model = reduce_params(model_params, sum_fn, select)
     return summed_model
 
-def pairwise_param_map(params_a, params_b, map_fn):
+def pairwise_param_map(params_a, params_b, map_fn, select):
     a_params = params_a.keys()
     b_params = params_b.keys()
     
     new_params = {}
     
     for param_name in a_params:
-        new_params[param_name] = map_fn(params_a[param_name], params_b[param_name])
+        if select is not None and select in param_name:
+            new_params[param_name] = map_fn(params_a[param_name], params_b[param_name])
+        else:
+            new_params[param_name] = params_a[param_name]
     return new_params
 
-def element_wise_multiply(params_a, params_b):
-    element_wise_mul = lambda x, y: torch.mul(x, y)
-    element_wise_mul_model = pairwise_param_map(params_a, params_b, element_wise_mul)
-    return element_wise_mul_model
-
-def divide(params_a, params_b):
+def divide(params_a, params_b, select):
     divide_fn = lambda x, y: x / y
     divide_model = pairwise_param_map(
-        params_a, params_b, divide_fn
+        params_a, params_b, divide_fn, select
     )
     return divide_model
+
+def element_wise_multiply(params_a, params_b, select):
+    element_wise_mul = lambda x, y: torch.mul(x, y)
+    element_wise_mul_model = pairwise_param_map(params_a, params_b, element_wise_mul, select)
+    return element_wise_mul_model
+
+
 
 def set_minimum(model_parameters, epsilon):
     """
@@ -326,34 +373,50 @@ def detach_metadata(stored_metadata):
 
 
 # HUGGING FACE DATA PRE-PROCESSING
+# Partially borrowed from https://github.com/ovh/ai-training-examples/blob/main/notebooks/natural-language-processing/llm/miniconda/llama2-fine-tuning/llama_2_finetuning.ipynb
 
 def preprocess_instruct(examples):
     # Concatenate 'prompt' and 'completion' fields
     texts = [prompt + " " + completion for prompt, completion in zip(examples['prompt'], examples['completion'])]
     return {'text': texts}
 
-# Remove 'prompt' and 'completion' keys from the dataset
-def remove_unnecessary_columns(example):
-    return {
-        "input_ids": example["input_ids"],
-        "attention_mask": example["attention_mask"]
-    }
-
-def shift_labels_to_the_right(examples):
-    examples['labels'] = examples['input_ids'].copy()
-    examples['labels'] = [x[1:] + [-100] for x in examples['labels']]
-    return examples
+def get_max_length(model):
+    conf = model.config
+    max_length = None
+    for length_setting in ["n_positions", "max_position_embeddings", "seq_length"]:
+        max_length = getattr(model.config, length_setting, None)
+        if max_length:
+            print(f"Found max lenth: {max_length}")
+            break
+    if not max_length:
+        max_length = 1024
+        print(f"Using default max length: {max_length}")
+    return max_length
 
 # Tokenize the dataset
-def tokenize_function(example):
+def tokenize_function(example, max_length):
     return tokenizer(
         example["prompt"],
         example["completion"],
         truncation=True,       # truncate to the model's max length
-        max_length=128,        # max length for the tokens
+        max_length=max_length,        # max length for the tokens
         padding="max_length",  # add padding to the tokens
         return_tensors="pt"    # return PyTorch tensors
     )
+
+
+# Remove 'prompt' and 'completion' keys from the dataset
+# def remove_unnecessary_columns(example):
+#     return {
+#         "input_ids": example["input_ids"],
+#         "attention_mask": example["attention_mask"]
+#     }
+
+def shift_labels_right(examples):
+    examples['labels'] = examples['input_ids'].copy()
+    examples['labels'] = [x[1:] + [-100] for x in examples['labels']]
+    return examples
+
 
 
 
@@ -365,9 +428,13 @@ if __name__ == "__main__":
     dataset = "instruct"
     cluster = "cedar"
     
+    pretrained_model = "llama-2-7b-instruct_lora-att-d0-r32-a16-2"
+    num_clusters = 2
+    
     compute_fishers = False
     model_lambda_factor = 9
     model_lambda = 0.1 * model_lambda_factor
+    epoch_num = 1
 
     if cluster == "cedar":
         if dataset == "guanaco":
@@ -388,24 +455,40 @@ if __name__ == "__main__":
         print(f"Training dataset set to: {dataset} from local path: {dataset_path}")
         
     model_name = "meta-llama/Llama-2-7b-hf"
+    if model_name != "meta-llama/Llama-2-7b-hf":
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            low_cpu_mem_usage=True,
+            return_dict=True,
+            torch_dtype=torch.float16,
+            device_map="auto", # Parallelize across GPUs
+        )
+        max_length = get_max_length(model) # Returns 4096
+    else:
+        max_length = 1024
+    
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
     
+    
     # Pre-process and tokenize dataset for loss calculations
-    tokenized_dataset = train_dataset.map(tokenize_function, batched=True)
-    tokenized_dataset = tokenized_dataset.map(remove_unnecessary_columns, batched=True)
+    tokenized_dataset = train_dataset.map(
+        partial(tokenize_function, max_length=max_length), 
+        batched=True,
+        # remove_columns=["prompt", "completion"]
+    )
     tokenized_dataset = tokenized_dataset.map(
         lambda examples: {'input_ids': examples['input_ids'], 'attention_mask': examples['attention_mask']},
         batched=True,
         remove_columns=tokenized_dataset.column_names  # This removes all columns except the ones specified above
     )
-    tokenized_dataset = tokenized_dataset.map(shift_labels_to_the_right, batched=True)
+    tokenized_dataset = tokenized_dataset.map(shift_labels_right, batched=True)
+    # tokenized_dataset = dataset.filter(lambda sample: len(sample["input_ids"]) < max_length)
+    print(f"Tokenized dataset length: {len(tokenized_dataset)}")
     
     # Load checkpoints
-    pretrained_model = "llama-2-7b-instruct_lora-att-d0-r32-a16-2"
-    num_clusters = 2
-    checkpoint_dict = load_checkpoints(pretrained_model, num_clusters, torch.device("cpu"), target_epoch='epoch_1')
+    checkpoint_dict = load_checkpoints(pretrained_model, num_clusters, torch.device("cpu"), target_epoch=f'epoch_{epoch_num}')
     
     if compute_fishers:
         for model_folder in checkpoint_dict.keys():
@@ -414,7 +497,7 @@ if __name__ == "__main__":
             fisher_path = os.path.join('fishers/', fisher_name)
             # model = load_file(checkpoint_dict[model_folder])
             checkpoint_path = checkpoint_dict[model_folder]
-            get_model_fisher(checkpoint_path, tokenized_dataset, tokenizer, fisher_path)
+            get_model_fisher(model_name, checkpoint_path, tokenized_dataset, tokenizer, fisher_path)
             print(f'Saved fisher for {model_folder} at {fisher_path}')
         
         
@@ -422,7 +505,7 @@ if __name__ == "__main__":
     # https://github.com/r-three/mats/blob/main/src/merging/diagonal_fisherMerging.py
     
     # Load fishers
-    print(f"Beginning model merging process with model lambda {model_lambda}...")
+    print(f"Beginning model merging process with the following configs: \nmodel: {pretrained_model} \ndataset: {dataset} \nepoch: {epoch_num}\nmodel_lambda: {model_lambda:.2f}")
     
     loaded_fishers = {}
     for model_folder in checkpoint_dict.keys():
@@ -440,7 +523,6 @@ if __name__ == "__main__":
     cluster_keys = []
     
     for model_folder, checkpoint_path in checkpoint_dict.items():
-        epoch_num = extract_epoch(checkpoint_path)
         cluster = get_cluster(model_folder)
         cluster_keys.append(cluster)
         print(f"Adding checkpoint path for {model_folder} and {cluster}: {checkpoint_path}")
@@ -454,6 +536,7 @@ if __name__ == "__main__":
     
     weighted_checkpoint_list = []
     fisher_list = []
+    select_param = None
     
     for cluster in cluster_keys:
         if 'checkpoint' not in checkpoint_fisher_matrices[cluster] or 'fisher' not in checkpoint_fisher_matrices[cluster]:
@@ -463,41 +546,52 @@ if __name__ == "__main__":
         print(f"cluster name: {cluster}")
         print(f"matrix keys: {checkpoint_fisher_matrix.keys()}")
         
-        checkpoint_path = checkpoint_fisher_matrix["checkpoint"]
-        checkpoint_model = AutoModelForCausalLM.from_pretrained(
-            checkpoint_path,
-            low_cpu_mem_usage=True,
-            return_dict=True,
-            torch_dtype=torch.float16,
-        )
+        # checkpoint_path = checkpoint_fisher_matrix["checkpoint"]
+        # checkpoint_model = AutoModelForCausalLM.from_pretrained(
+        #     checkpoint_path,
+        #     low_cpu_mem_usage=True,
+        #     return_dict=True,
+        #     torch_dtype=torch.float16,
+        # )
+        print(f"loading peft model {model_name} with adapter {checkpoint_path}")
+        checkpoint_model = load_peft_model(model_name, checkpoint_path)
         checkpoint = checkpoint_model.state_dict()
         checkpoint = {key: value.to('cpu') for key, value in checkpoint.items()}
         
         print(f'Loaded checkpoint for {cluster}')
+        debug_params(checkpoint_path, checkpoint)
 
         fisher = checkpoint_fisher_matrix["fisher"]
         fisher = set_minimum(fisher, 1e-8)
+        
         print(f'Loaded fisher for {cluster}')
+        debug_params("fisher", fisher)
         
         # Scale fishers
         if len(checkpoint_dict) == 2:
             if len(fisher_list) == 0:
-                fisher = scale(fisher, model_lambda)
+                fisher = scale(fisher, model_lambda, select=select_param)
+                debug_params("scaled fisher", fisher)
             else:
                 assert len(fisher_list) == 1
-                fisher = scale(fisher, (1 - model_lambda))
+                fisher = scale(fisher, (1 - model_lambda), select=select_param)
+                debug_params("scaled fisher", fisher)
                 
         weighted_cp = pairwise_param_map(
-            checkpoint, fisher, lambda x, y: x * y
+            checkpoint, fisher, lambda x, y: x * y, select=select_param
         )
+        debug_params("weighted_cp", weighted_cp)
         
         weighted_checkpoint_list.append(weighted_cp)
         fisher_list.append(fisher)
         
-    merged_model = divide(
-        scale_and_sum(weighted_checkpoint_list, 1),
-        scale_and_sum(fisher_list, 1)
-    )
+    weighted_cp_sum = scale_and_sum(weighted_checkpoint_list, 1, select=select_param)
+    debug_params("weighted_cp_sum", weighted_cp_sum)
+    fisher_sum = scale_and_sum(fisher_list, 1, select=select_param)
+    debug_params("fisher_sum", fisher_sum)
+    
+    merged_model = divide(weighted_cp_sum, fisher_sum, select=select_param)
+    debug_params("merged_model", merged_model)
     
     merged_filename = pretrained_model + '-merged-ep' + str(epoch_num) + '-ml' + str(model_lambda_factor) + '.pt'
     merged_path = os.path.join('merged_models/', merged_filename)

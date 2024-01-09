@@ -9,7 +9,7 @@ def find_lora_weight_keys(state_dict):
     return [key for key in state_dict.keys() if 'lora' in key]
 
 # List directories that match the model pattern
-model_dirs = [d for d in os.listdir('.') if 'llama-2-7b-guanaco-attention' in d and 'cluster' in d]
+model_dirs = [d for d in os.listdir('.') if 'llama-2-7b-instruct_lora-att-d0-r64-a16' in d and 'cluster' in d]
 
 # Load the base model for compatibility checks
 base_model_name = "meta-llama/Llama-2-7b-hf"
@@ -18,7 +18,7 @@ base_model = AutoModelForCausalLM.from_pretrained(base_model_name, torch_dtype=t
 select_groups = [2]
 
 # Process each group of models
-for group in set(re.match(r'llama-2-7b-guanaco-attention-(\d+)_cluster', d).group(1) for d in model_dirs if re.match(r'llama-2-7b-guanaco-attention-\d+_cluster', d)):
+for group in set(re.match(r'llama-2-7b-instruct_lora-att-d0-r64-a16-(\d+)_cluster', d).group(1) for d in model_dirs if re.match(r'llama-2-7b-instruct_lora-att-d0-r64-a16-\d+_cluster', d)):
 
     
     if int(group) in select_groups:
@@ -27,9 +27,10 @@ for group in set(re.match(r'llama-2-7b-guanaco-attention-(\d+)_cluster', d).grou
         print(f'Processing group {group}...')
 
         # Accumulate weights for each adapter in the group
-        for model_dir in (d for d in model_dirs if d.startswith(f'llama-2-7b-guanaco-attention-{group}_cluster')):
-            print(f'Loading model from directory: {model_dir}')
-            model = PeftModel.from_pretrained(base_model, model_dir)
+        for model_dir in (d for d in model_dirs if d.startswith(f'llama-2-7b-instruct_lora-att-d0-r64-a16-{group}_cluster')):
+            model_path = os.path.join(model_dir, 'epoch_1/') 
+            print(f'Loading model from directory: {model_path}')
+            model = PeftModel.from_pretrained(base_model, model_path)
             num_models += 1
 
             # Initialize summed_weights with the first model's state_dict structure
@@ -45,7 +46,7 @@ for group in set(re.match(r'llama-2-7b-guanaco-attention-(\d+)_cluster', d).grou
         average_weights = {key: summed_weights[key] / num_models for key in lora_weight_keys}
 
         # Save the averaged adapter weights and config
-        avg_adapter_dir = f'llama-2-7b-guanaco-attention-{group}_full_adapter'
+        avg_adapter_dir = f'llama-2-7b-instruct_lora-att-d0-r64-a16-{group}_adapter'
         os.makedirs(avg_adapter_dir, exist_ok=True)
 
         # Save the weights
@@ -53,7 +54,7 @@ for group in set(re.match(r'llama-2-7b-guanaco-attention-(\d+)_cluster', d).grou
 
         # Save the config - assume the config is the same for all models in the group
         # and use the first model's config as the reference
-        first_model_config = PeftConfig.from_pretrained(model_dirs[0])
+        first_model_config = PeftConfig.from_pretrained(os.path.join(model_dirs[0], 'epoch_1/'))
         first_model_config.save_pretrained(avg_adapter_dir)
 
         print(f'Finished processing group {group}.')
