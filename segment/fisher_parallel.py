@@ -261,35 +261,44 @@ def get_cluster(checkpoint):
 
 # MODEL OPERATIONS
 
+def print_parameter_dict(d, indent=0):
+    for k, v in d.items():
+        indentation = ' ' * indent
+        if torch.isnan(v).any():
+            print(f"{indentation}{k}: {type(v)}, contains NaN")
+        elif not isinstance(v, torch.Tensor):
+            print(f"{indentation}{k}: {type(v)}, not a tensor")
+
 def debug_params(model_label, model_params, verbose=False):
     bug_counter = 0
     nan_params = []
     non_tensor_params = []
     for param_name, param_value in model_params.items():
         if isinstance(param_value, tuple):
-            if verbose print(f"WARNING: Tuple found in {model_label} in parameter: {param_name}")
-            if verbose print(param_value)
+            if verbose: print(f"WARNING: Tuple found in {model_label} in parameter: {param_name}")
+            if verbose: print(param_value)
             bug_counter += 1
             non_tensor_params.append(param_name)
         elif not isinstance(param_value, torch.Tensor):
-            if verbose print(f"WARNING: Non-tensor found in {model_label} in parameter: {param_name}: {type(param_value)}")
+            if verbose: print(f"WARNING: Non-tensor found in {model_label} in parameter: {param_name}: {type(param_value)}")
             bug_counter += 1
             non_tensor_params.append(param_name)
         elif torch.isnan(param_value).any():
-            if verbose print(f"WARNING: parameter {param_name} contains NaN")
+            if verbose: print(f"WARNING: parameter {param_name} contains NaN")
             bug_counter += 1
             nan_params.append(param_name)
-    
     if bug_counter == 0:
         print(f"SUCCESS: {model_label} contains no NaN or non-tensor parameter values")
     else:
         if len(nan_params) > 0:
-            print(f"WARNING: Non-tensor found in {model_label} in parameters: \n{nan_params[:10]})
+            print(f"WARNING: NaN param found in {model_label} in parameters:")
+            print_parameter_dict(model_params, indent=4)
         elif len(non_tensor_params) > 0:
-            print(f"WARNING: Tuple found in {model_label} in parameters: {non_tensor_params[:10]}")
+            print(f"WARNING: Non-tensor param found in {model_label} in parameters:")
+            print_parameter_dict(model_params, indent=4)
             
 
-def map_params(model_params, map_fn, select):
+def param_map(model_params, map_fn, select):
     new_params = {}
     for param_name, param_value in model_params.items():
         if select is not None and select in param_name:
@@ -300,7 +309,7 @@ def map_params(model_params, map_fn, select):
 
 def scale(model_params, scaler, select):
     scale_fn = lambda x: x * scaler
-    scaled_model = map_params(model_params, scale_fn, select)
+    scaled_model = param_map(model_params, scale_fn, select)
     return scaled_model
 
 def reduce_params(model_params, reduce_fn, select):
@@ -312,7 +321,7 @@ def reduce_params(model_params, reduce_fn, select):
         if select is not None and select in param_name:
             new_params[param_name] = reduce_fn(torch.stack(list(param_value), dim=0))
         else:
-            new_params[param_name] = param_value
+            new_params[param_name] = param_value[0]
     return new_params
 
 def scale_and_sum(model_params, model_lambda, select):
@@ -328,22 +337,46 @@ def pairwise_param_map(params_a, params_b, map_fn, select):
     
     for param_name in a_params:
         if select is not None and select in param_name:
-            new_params[param_name] = map_fn(params_a[param_name], params_b[param_name])
+            # Ensure both parameter sets have the parameter by name before mapping
+            if param_name in b_params:
+                new_params[param_name] = map_fn(params_a[param_name], params_b[param_name])
+            else:
+                raise KeyError(f"Parameter {param_name} not found in the second set of parameters.")
         else:
             new_params[param_name] = params_a[param_name]
     return new_params
 
-def divide(params_a, params_b, select):
-    divide_fn = lambda x, y: x / y
+def divide(params_a, params_b, select, epsilon=1e-8):
+    # Define the safe division function
+    divide_fn = lambda x, y: x / (y + epsilon * (y == 0).float())
     divide_model = pairwise_param_map(
         params_a, params_b, divide_fn, select
     )
     return divide_model
 
-def element_wise_multiply(params_a, params_b, select):
-    element_wise_mul = lambda x, y: torch.mul(x, y)
-    element_wise_mul_model = pairwise_param_map(params_a, params_b, element_wise_mul, select)
-    return element_wise_mul_model
+# def element_wise_multiply(params_a, params_b, select):
+#     element_wise_mul = lambda x, y: torch.mul(x, y)
+#     element_wise_mul_model = pairwise_param_map(params_a, params_b, element_wise_mul, select)
+#     return element_wise_mul_model
+
+def compare_params(dict1, dict2):
+    # Find keys that are only in the first dictionary
+    unique_to_dict1 = set(dict1.keys()) - set(dict2.keys())
+    
+    # Find keys that are only in the second dictionary
+    unique_to_dict2 = set(dict2.keys()) - set(dict1.keys())
+    
+    # Report the differences
+    if unique_to_dict1 or unique_to_dict2:
+        print("The parameter dictionaries do not align.")
+        if unique_to_dict1:
+            print(f"Keys unique to the first dictionary: {unique_to_dict1}")
+        if unique_to_dict2:
+            print(f"Keys unique to the second dictionary: {unique_to_dict2}")
+        return unique_to_dict1, unique_to_dict2
+    else:
+        print("The parameter dictionaries align perfectly.")
+        return None, None
 
 
 
@@ -432,6 +465,8 @@ if __name__ == "__main__":
     num_clusters = 2
     
     compute_fishers = False
+    debug_mode = True
+    select_param = 'lora'
     model_lambda_factor = 9
     model_lambda = 0.1 * model_lambda_factor
     epoch_num = 1
@@ -536,7 +571,6 @@ if __name__ == "__main__":
     
     weighted_checkpoint_list = []
     fisher_list = []
-    select_param = None
     
     for cluster in cluster_keys:
         if 'checkpoint' not in checkpoint_fisher_matrices[cluster] or 'fisher' not in checkpoint_fisher_matrices[cluster]:
@@ -559,39 +593,43 @@ if __name__ == "__main__":
         checkpoint = {key: value.to('cpu') for key, value in checkpoint.items()}
         
         print(f'Loaded checkpoint for {cluster}')
-        debug_params(checkpoint_path, checkpoint)
+        if debug_mode: debug_params(checkpoint_path, checkpoint)
 
         fisher = checkpoint_fisher_matrix["fisher"]
         fisher = set_minimum(fisher, 1e-8)
         
         print(f'Loaded fisher for {cluster}')
-        debug_params("fisher", fisher)
+        if debug_mode: debug_params("fisher", fisher)
         
         # Scale fishers
         if len(checkpoint_dict) == 2:
             if len(fisher_list) == 0:
                 fisher = scale(fisher, model_lambda, select=select_param)
-                debug_params("scaled fisher", fisher)
+                if debug_mode: debug_params("scaled fisher", fisher)
             else:
                 assert len(fisher_list) == 1
                 fisher = scale(fisher, (1 - model_lambda), select=select_param)
-                debug_params("scaled fisher", fisher)
+                if debug_mode: debug_params("scaled fisher", fisher)
                 
         weighted_cp = pairwise_param_map(
             checkpoint, fisher, lambda x, y: x * y, select=select_param
         )
-        debug_params("weighted_cp", weighted_cp)
+        if debug_mode: debug_params("weighted_cp", weighted_cp)
         
         weighted_checkpoint_list.append(weighted_cp)
         fisher_list.append(fisher)
         
     weighted_cp_sum = scale_and_sum(weighted_checkpoint_list, 1, select=select_param)
-    debug_params("weighted_cp_sum", weighted_cp_sum)
+    torch.save(weighted_cp_sum, "weighted_cp_sum.pt")
+    if debug_mode: debug_params("weighted_cp_sum", weighted_cp_sum)
     fisher_sum = scale_and_sum(fisher_list, 1, select=select_param)
-    debug_params("fisher_sum", fisher_sum)
-    
+    if debug_mode: debug_params("fisher_sum", fisher_sum)
+    torch.save(fisher_sum, "fisher_sum.pt")
+   
+    compare_params(weighted_cp_sum, fisher_sum)
     merged_model = divide(weighted_cp_sum, fisher_sum, select=select_param)
-    debug_params("merged_model", merged_model)
+    
+    if debug_mode: debug_params("merged_model", merged_model)
     
     merged_filename = pretrained_model + '-merged-ep' + str(epoch_num) + '-ml' + str(model_lambda_factor) + '.pt'
     merged_path = os.path.join('merged_models/', merged_filename)
