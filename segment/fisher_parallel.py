@@ -1,6 +1,3 @@
-# Trainable param regex: https://github.com/r-three/mats/blob/a7165f84cff194596465b50c49a49bcd4dbd0fbe/src/model/load_model.py#L63
-
-# Use conjugate gradient calculation from scipy
 import os
 import re
 from scipy.sparse.linalg import LinearOperator, cg # for conjugate gradient methods
@@ -39,19 +36,11 @@ def compute_diag_fisher(model, param_regex):
     example_fisher = {}
     for param_name, param in model.named_parameters():
         if re.fullmatch(param_regex, param_name) and param.requires_grad:
-            # Ensure that the gradient computation is done on the CPU
-            # grad = param.grad.cpu() if param.grad is not None else None
             grad = param.grad if param.grad is not None else None
             if grad is not None:
-                # Initialize the example_fisher entry on the CPU
                 if param_name not in example_fisher:
                     example_fisher[param_name] = torch.zeros_like(param.data)
-                    # print(f"Adding parameter {param_name} to fisher matrix")
-                    # print(f"example_fisher keys: {example_fisher.keys()}")
-                # Perform the square operation on CPU and accumulate
                 example_fisher[param_name] += torch.square(grad)
-
-    # print(f"example_fisher keys: {example_fisher.keys()}")
     return example_fisher
     
 
@@ -121,7 +110,7 @@ def get_model_fisher(pretrained_model, checkpoint_path, dataset, tokenizer, fish
         
     torch.save(detach_metadata(stored_fisher), fisher_path)
     
-    
+
 def conjugate_gradient_forward(
     sum_fisher_matrices, 
     sum_fisher_times_weight, 
@@ -187,10 +176,6 @@ def get_tokenized_dataloader(tokenized_dataset, tokenizer, batch_size):
     return dataloader
 
 def load_checkpoints(pretrained_model, num_clusters, device, target_epoch=None):
-    """
-    Load model cluster checkpoints to merge.
-    """
-
     checkpoint_dict = {}
     base_path = "./"
 
@@ -213,29 +198,6 @@ def load_checkpoints(pretrained_model, num_clusters, device, target_epoch=None):
 
     return checkpoint_dict
 
-# def combine_safetensors(file_paths):
-#     """
-#     Load multiple SafeTensor files and combine their state dictionaries.
-#     """
-#     combined_state_dict = {}
-
-#     for file_path in file_paths:
-#         # Load the state dict from the current SafeTensor file
-#         with open(file_path, "rb") as f:
-#             data = f.read()
-#         f.close()
-            
-#         state_dict = load_safetensors(data)
-
-#         # Check for key conflicts before updating
-#         intersecting_keys = combined_state_dict.keys() & state_dict.keys()
-#         if intersecting_keys:
-#             raise ValueError(f"Conflicting keys found when loading {file_path}: {intersecting_keys}")
-
-#         # Update the combined state dictionary
-#         combined_state_dict.update(state_dict)
-
-#     return combined_state_dict
 
 
 # REGEX FUNCTIONS
@@ -245,29 +207,8 @@ def get_cluster(checkpoint):
     matches = pattern.findall(checkpoint)
     return matches[-1] if matches else None
 
-# def get_model_safetensors(directory):
-#     pattern = re.compile(r'model-\d+-of-\d+\.safetensors$')
-#     model_files = []
-#     for filename in os.listdir(directory):
-#         if pattern.match(filename) and not filename.startswith('adapter_model'):
-#             model_files.append(os.path.join(directory, filename))
-
-#     model_files.sort()
-#     print(model_files)
-
-#     return model_files  
-
-        
 
 # MODEL OPERATIONS
-
-def print_parameter_dict(d, indent=0):
-    for k, v in d.items():
-        indentation = ' ' * indent
-        if torch.isnan(v).any():
-            print(f"{indentation}{k}: {type(v)}, contains NaN")
-        elif not isinstance(v, torch.Tensor):
-            print(f"{indentation}{k}: {type(v)}, not a tensor")
 
 def debug_params(model_label, model_params, verbose=False):
     bug_counter = 0
@@ -297,11 +238,10 @@ def debug_params(model_label, model_params, verbose=False):
             print(f"WARNING: Non-tensor param found in {model_label} in parameters:")
             print_parameter_dict(model_params, indent=4)
             
-
 def param_map(model_params, map_fn, select):
     new_params = {}
     for param_name, param_value in model_params.items():
-        if select is not None and select in param_name:
+        if select is not None and all(substring in param_name for substring in select):
             new_params[param_name] = map_fn(param_value)
         else:
             new_params[param_name] = param_value
@@ -318,7 +258,7 @@ def reduce_params(model_params, reduce_fn, select):
     
     new_params = {}
     for param_name, param_value in zip(*[param_names, param_values]):
-        if select is not None and select in param_name:
+        if select is not None and all(substring in param_name for substring in select):
             new_params[param_name] = reduce_fn(torch.stack(list(param_value), dim=0))
         else:
             new_params[param_name] = param_value[0]
@@ -336,7 +276,7 @@ def pairwise_param_map(params_a, params_b, map_fn, select):
     new_params = {}
     
     for param_name in a_params:
-        if select is not None and select in param_name:
+        if select is not None and all(substring in param_name for substring in select):
             # Ensure both parameter sets have the parameter by name before mapping
             if param_name in b_params:
                 new_params[param_name] = map_fn(params_a[param_name], params_b[param_name])
@@ -347,38 +287,11 @@ def pairwise_param_map(params_a, params_b, map_fn, select):
     return new_params
 
 def divide(params_a, params_b, select, epsilon=1e-8):
-    # Define the safe division function
     divide_fn = lambda x, y: x / (y + epsilon * (y == 0).float())
     divide_model = pairwise_param_map(
         params_a, params_b, divide_fn, select
     )
     return divide_model
-
-# def element_wise_multiply(params_a, params_b, select):
-#     element_wise_mul = lambda x, y: torch.mul(x, y)
-#     element_wise_mul_model = pairwise_param_map(params_a, params_b, element_wise_mul, select)
-#     return element_wise_mul_model
-
-def compare_params(dict1, dict2):
-    # Find keys that are only in the first dictionary
-    unique_to_dict1 = set(dict1.keys()) - set(dict2.keys())
-    
-    # Find keys that are only in the second dictionary
-    unique_to_dict2 = set(dict2.keys()) - set(dict1.keys())
-    
-    # Report the differences
-    if unique_to_dict1 or unique_to_dict2:
-        print("The parameter dictionaries do not align.")
-        if unique_to_dict1:
-            print(f"Keys unique to the first dictionary: {unique_to_dict1}")
-        if unique_to_dict2:
-            print(f"Keys unique to the second dictionary: {unique_to_dict2}")
-        return unique_to_dict1, unique_to_dict2
-    else:
-        print("The parameter dictionaries align perfectly.")
-        return None, None
-
-
 
 def set_minimum(model_parameters, epsilon):
     """
@@ -437,20 +350,10 @@ def tokenize_function(example, max_length):
         return_tensors="pt"    # return PyTorch tensors
     )
 
-
-# Remove 'prompt' and 'completion' keys from the dataset
-# def remove_unnecessary_columns(example):
-#     return {
-#         "input_ids": example["input_ids"],
-#         "attention_mask": example["attention_mask"]
-#     }
-
 def shift_labels_right(examples):
     examples['labels'] = examples['input_ids'].copy()
     examples['labels'] = [x[1:] + [-100] for x in examples['labels']]
     return examples
-
-
 
 
 if __name__ == "__main__":
@@ -466,10 +369,23 @@ if __name__ == "__main__":
     
     compute_fishers = False
     debug_mode = True
-    select_param = 'lora'
+    select_params = ['lora', 'attn']
     model_lambda_factor = 9
     model_lambda = 0.1 * model_lambda_factor
     epoch_num = 1
+    
+    print(
+        f"""
+        Beginning model merging process with the following configs:
+        Model: {pretrained_model}
+        Dataset: {dataset}
+        Epoch: {epoch_num}
+        Model Lambda: {model_lambda:.2f}
+        Target Parameters: {select_params}
+        Compute Fishers: {compute_fishers}
+        Debug Mode: {debug_mode}
+        """
+    )
 
     if cluster == "cedar":
         if dataset == "guanaco":
@@ -506,12 +422,10 @@ if __name__ == "__main__":
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
     
-    
     # Pre-process and tokenize dataset for loss calculations
     tokenized_dataset = train_dataset.map(
         partial(tokenize_function, max_length=max_length), 
         batched=True,
-        # remove_columns=["prompt", "completion"]
     )
     tokenized_dataset = tokenized_dataset.map(
         lambda examples: {'input_ids': examples['input_ids'], 'attention_mask': examples['attention_mask']},
@@ -519,7 +433,6 @@ if __name__ == "__main__":
         remove_columns=tokenized_dataset.column_names  # This removes all columns except the ones specified above
     )
     tokenized_dataset = tokenized_dataset.map(shift_labels_right, batched=True)
-    # tokenized_dataset = dataset.filter(lambda sample: len(sample["input_ids"]) < max_length)
     print(f"Tokenized dataset length: {len(tokenized_dataset)}")
     
     # Load checkpoints
@@ -539,27 +452,21 @@ if __name__ == "__main__":
     # MERGE FISHERS
     # https://github.com/r-three/mats/blob/main/src/merging/diagonal_fisherMerging.py
     
-    # Load fishers
-    print(f"Beginning model merging process with the following configs: \nmodel: {pretrained_model} \ndataset: {dataset} \nepoch: {epoch_num}\nmodel_lambda: {model_lambda:.2f}")
-    
+    # Load fishers    
     loaded_fishers = {}
     for model_folder in checkpoint_dict.keys():
         fisher_name = f"{model_folder}_fisher.pt"
         fisher_path = os.path.join('fishers/', fisher_name)
         fisher = torch.load(fisher_path, torch.device("cpu"))
         loaded_fishers[model_folder] = fisher
-        print(f'Loaded fisher for {model_folder}!')
-    print(f"keys for loaded_fishers: {loaded_fishers.keys()}")
-    
-    checkpoint_fisher_matrices = {}
+    if debug_mode: print(f"keys for loaded_fishers: {loaded_fishers.keys()}")
     
     # The original implementation merges checkpoints by dataset
     # For adapters, merge checkpoints by cluster
-    cluster_keys = []
+    checkpoint_fisher_matrices = {}
     
     for model_folder, checkpoint_path in checkpoint_dict.items():
         cluster = get_cluster(model_folder)
-        cluster_keys.append(cluster)
         print(f"Adding checkpoint path for {model_folder} and {cluster}: {checkpoint_path}")
         checkpoint_fisher_matrices[cluster] = {"checkpoint": checkpoint_path}
         
@@ -572,21 +479,9 @@ if __name__ == "__main__":
     weighted_checkpoint_list = []
     fisher_list = []
     
-    for cluster in cluster_keys:
-        if 'checkpoint' not in checkpoint_fisher_matrices[cluster] or 'fisher' not in checkpoint_fisher_matrices[cluster]:
-            raise KeyError(f"Missing 'checkpoint' or 'fisher' key for cluster {cluster}")
-    
     for cluster, checkpoint_fisher_matrix in checkpoint_fisher_matrices.items():
-        print(f"cluster name: {cluster}")
-        print(f"matrix keys: {checkpoint_fisher_matrix.keys()}")
-        
-        # checkpoint_path = checkpoint_fisher_matrix["checkpoint"]
-        # checkpoint_model = AutoModelForCausalLM.from_pretrained(
-        #     checkpoint_path,
-        #     low_cpu_mem_usage=True,
-        #     return_dict=True,
-        #     torch_dtype=torch.float16,
-        # )
+        if debug_mode: print(f"cluster name: {cluster}")
+        if debug_mode: print(f"matrix keys: {checkpoint_fisher_matrix.keys()}")
         print(f"loading peft model {model_name} with adapter {checkpoint_path}")
         checkpoint_model = load_peft_model(model_name, checkpoint_path)
         checkpoint = checkpoint_model.state_dict()
@@ -604,34 +499,39 @@ if __name__ == "__main__":
         # Scale fishers
         if len(checkpoint_dict) == 2:
             if len(fisher_list) == 0:
-                fisher = scale(fisher, model_lambda, select=select_param)
+                fisher = scale(fisher, model_lambda, select=select_params)
                 if debug_mode: debug_params("scaled fisher", fisher)
             else:
                 assert len(fisher_list) == 1
-                fisher = scale(fisher, (1 - model_lambda), select=select_param)
+                fisher = scale(fisher, (1 - model_lambda), select=select_params)
                 if debug_mode: debug_params("scaled fisher", fisher)
                 
         weighted_cp = pairwise_param_map(
-            checkpoint, fisher, lambda x, y: x * y, select=select_param
+            checkpoint, fisher, lambda x, y: x * y, select=select_params
         )
         if debug_mode: debug_params("weighted_cp", weighted_cp)
         
         weighted_checkpoint_list.append(weighted_cp)
         fisher_list.append(fisher)
         
-    weighted_cp_sum = scale_and_sum(weighted_checkpoint_list, 1, select=select_param)
-    torch.save(weighted_cp_sum, "weighted_cp_sum.pt")
+    weighted_cp_sum = scale_and_sum(weighted_checkpoint_list, 1, select=select_params)
     if debug_mode: debug_params("weighted_cp_sum", weighted_cp_sum)
-    fisher_sum = scale_and_sum(fisher_list, 1, select=select_param)
+    fisher_sum = scale_and_sum(fisher_list, 1, select=select_params)
     if debug_mode: debug_params("fisher_sum", fisher_sum)
-    torch.save(fisher_sum, "fisher_sum.pt")
    
-    compare_params(weighted_cp_sum, fisher_sum)
-    merged_model = divide(weighted_cp_sum, fisher_sum, select=select_param)
+    merged_model = divide(weighted_cp_sum, fisher_sum, select=select_params)
     
     if debug_mode: debug_params("merged_model", merged_model)
-    
-    merged_filename = pretrained_model + '-merged-ep' + str(epoch_num) + '-ml' + str(model_lambda_factor) + '.pt'
+    selected_params_part = '-' + '-'.join(select_params)
+
+    # Construct the merged filename dynamically
+    merged_filename = (
+        f"{pretrained_model}"
+        f"{selected_params_part}"
+        f"-fisher-ep{epoch_num}"
+        f"-ml{int(model_lambda_factor)}" 
+        ".pt"
+    )
     merged_path = os.path.join('merged_models/', merged_filename)
     torch.save(merged_model, merged_path)
     print(f'Merged models and saved to {merged_path}')
