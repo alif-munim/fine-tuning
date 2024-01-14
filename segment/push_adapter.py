@@ -20,27 +20,34 @@ model_name = "meta-llama/Llama-2-7b-hf"
 save_merged = True
 save_adapter = False
 push_to_hub = False
+epoch_num = 1
+epoch_folder = "epoch_" + str(epoch_num)
 
-adapter_model = "llama-2-7b-instruct_lora-att-d0-r32-a16-2_cluster_0"
-adapter_path = os.path.join(adapter_model, "epoch_1")
+adapter_model = f"llama-2-7b-instruct_lora-att-d0-r32-a16-2_adapter_epoch{epoch_num}"
+adapter_path = adapter_model
 
-merged_name = "llama-2-7b-instruct_lora-att-d0-r32-a16-2-lora-fisher-ep1-ml9"
+merged_name = f"llama-2-7b-instruct_lora-att-d0-r32-a16-2-lora-attn-cg-fisher-ep1-ml3"
 merged_checkpoint = os.path.join("merged_models", merged_name + '.pt')
 new_model = merged_name if save_merged else os.path.join(adapter_path, "model")
 
 base_model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        low_cpu_mem_usage=True,
-        return_dict=True,
-        torch_dtype=torch.float16,
-        # device_map=device_map,
-    )
-model = PeftModel.from_pretrained(base_model, adapter_path)
+    model_name,
+    low_cpu_mem_usage=True,
+    return_dict=True,
+    torch_dtype=torch.float16,
+    # device_map=device_map,
+)
+
 
 if save_adapter:
+    model = PeftModel.from_pretrained(base_model, adapter_path)
     model = model.merge_and_unload()
 
 if save_merged:
+    adapter_model = f"llama-2-7b-instruct_lora-att-d0-r32-a16-2_cluster_0"
+    adapter_path = os.path.join(adapter_model, epoch_folder)
+    model = PeftModel.from_pretrained(base_model, adapter_path)
+    
     model.load_state_dict(torch.load(merged_checkpoint))
     model = model.merge_and_unload()
 

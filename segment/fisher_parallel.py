@@ -1,6 +1,6 @@
 import os
 import re
-from scipy.sparse.linalg import LinearOperator, cg # for conjugate gradient methods
+from scipy.sparse.linalg import LinearOperator, cg as conjugate_gradient # for conjugate gradient methods
 
 from safetensors import safe_open # for checkpoint loading
 from safetensors.torch import load_model, save_model, load_file
@@ -120,11 +120,12 @@ def conjugate_gradient_forward(
 ):
     final_model = {}
     
-    for param_name in tqdm(all_param_names):
+    pbar = tqdm(total=len(all_param_names))    
+    for param_name in all_param_names:
         weight_shape = sum_fisher_times_weight[param_name].shape
         
         def matrix_vector_product(v):
-            v_weight_torch = from_numpy(v).reshape(weight_shape).float()
+            v_weight_torch = torch.from_numpy(v).reshape(weight_shape).float()
             matrix_vector = torch.mul(sum_fisher_matrices[param_name], v_weight_torch)
             return matrix_vector.flatten().cpu().numpy()
         
@@ -142,10 +143,12 @@ def conjugate_gradient_forward(
         
         final_error = np.linalg.norm(matrix_vector_product(x_final) - b.numpy())
         
-        final_weight = torch.tensor(x_final).reshape(weight.shape)
+        final_weight = torch.tensor(x_final).reshape(weight_shape)
         final_model[param_name] = final_weight
-        
-        return final_model
+        pbar.update(1)
+    
+    pbar.close()
+    return final_model
     
 
     
@@ -293,6 +296,11 @@ def divide(params_a, params_b, select, epsilon=1e-8):
     )
     return divide_model
 
+def element_wise_multiply(params_a, params_b, select):
+    element_wise_mul = lambda x, y: torch.mul(x, y)
+    element_wise_mul_model = pairwise_param_map(params_a, params_b, element_wise_mul, select)
+    return element_wise_mul_model
+
 def set_minimum(model_parameters, epsilon):
     """
     Set the minimum of the parameters to be epsilon. For any value less than epsilon,
@@ -370,9 +378,13 @@ if __name__ == "__main__":
     compute_fishers = False
     debug_mode = True
     select_params = ['lora', 'attn']
-    model_lambda_factor = 9
+    model_lambda_factor = 3
     model_lambda = 0.1 * model_lambda_factor
-    epoch_num = 1
+    epoch_num = 2
+    
+    use_conjugate_gradient = True
+    initialization = "average"
+    num_iters = 100
     
     print(
         f"""
@@ -382,6 +394,8 @@ if __name__ == "__main__":
         Epoch: {epoch_num}
         Model Lambda: {model_lambda:.2f}
         Target Parameters: {select_params}
+        Conjugate Gradient: {use_conjugate_gradient}
+        Initialization: {initialization}
         Compute Fishers: {compute_fishers}
         Debug Mode: {debug_mode}
         """
@@ -441,7 +455,7 @@ if __name__ == "__main__":
     if compute_fishers:
         for model_folder in checkpoint_dict.keys():
             print(f'Calculating fisher for {model_folder}...')
-            fisher_name = f"{model_folder}_fisher.pt"
+            fisher_name = f"{model_folder}_fisher_ep{epoch_num}.pt"
             fisher_path = os.path.join('fishers/', fisher_name)
             # model = load_file(checkpoint_dict[model_folder])
             checkpoint_path = checkpoint_dict[model_folder]
@@ -452,86 +466,201 @@ if __name__ == "__main__":
     # MERGE FISHERS
     # https://github.com/r-three/mats/blob/main/src/merging/diagonal_fisherMerging.py
     
-    # Load fishers    
-    loaded_fishers = {}
-    for model_folder in checkpoint_dict.keys():
-        fisher_name = f"{model_folder}_fisher.pt"
-        fisher_path = os.path.join('fishers/', fisher_name)
-        fisher = torch.load(fisher_path, torch.device("cpu"))
-        loaded_fishers[model_folder] = fisher
-    if debug_mode: print(f"keys for loaded_fishers: {loaded_fishers.keys()}")
-    
-    # The original implementation merges checkpoints by dataset
-    # For adapters, merge checkpoints by cluster
-    checkpoint_fisher_matrices = {}
-    
-    for model_folder, checkpoint_path in checkpoint_dict.items():
-        cluster = get_cluster(model_folder)
-        print(f"Adding checkpoint path for {model_folder} and {cluster}: {checkpoint_path}")
-        checkpoint_fisher_matrices[cluster] = {"checkpoint": checkpoint_path}
-        
-    for model_folder, loaded_fisher in loaded_fishers.items():
-        cluster = get_cluster(model_folder)
-        if cluster not in checkpoint_fisher_matrices:
-            raise ValueError(f"Cluster key {cluster} not found in checkpoint_fisher_matrices")
-        checkpoint_fisher_matrices[cluster].update({"fisher": loaded_fisher})
-    
-    weighted_checkpoint_list = []
-    fisher_list = []
-    
-    for cluster, checkpoint_fisher_matrix in checkpoint_fisher_matrices.items():
-        if debug_mode: print(f"cluster name: {cluster}")
-        if debug_mode: print(f"matrix keys: {checkpoint_fisher_matrix.keys()}")
-        print(f"loading peft model {model_name} with adapter {checkpoint_path}")
-        checkpoint_model = load_peft_model(model_name, checkpoint_path)
-        checkpoint = checkpoint_model.state_dict()
-        checkpoint = {key: value.to('cpu') for key, value in checkpoint.items()}
-        
-        print(f'Loaded checkpoint for {cluster}')
-        if debug_mode: debug_params(checkpoint_path, checkpoint)
+    if not use_conjugate_gradient:
+        # Load fishers    
+        loaded_fishers = {}
+        for model_folder in checkpoint_dict.keys():
+            fisher_name = f"{model_folder}_fisher_ep{epoch_num}.pt"
+            fisher_path = os.path.join('fishers/', fisher_name)
+            fisher = torch.load(fisher_path, torch.device("cpu"))
+            loaded_fishers[model_folder] = fisher
+        if debug_mode: print(f"keys for loaded_fishers: {loaded_fishers.keys()}")
 
-        fisher = checkpoint_fisher_matrix["fisher"]
-        fisher = set_minimum(fisher, 1e-8)
-        
-        print(f'Loaded fisher for {cluster}')
-        if debug_mode: debug_params("fisher", fisher)
-        
-        # Scale fishers
-        if len(checkpoint_dict) == 2:
-            if len(fisher_list) == 0:
-                fisher = scale(fisher, model_lambda, select=select_params)
-                if debug_mode: debug_params("scaled fisher", fisher)
-            else:
-                assert len(fisher_list) == 1
-                fisher = scale(fisher, (1 - model_lambda), select=select_params)
-                if debug_mode: debug_params("scaled fisher", fisher)
-                
-        weighted_cp = pairwise_param_map(
-            checkpoint, fisher, lambda x, y: x * y, select=select_params
+        # The original implementation merges checkpoints by dataset
+        # For adapters, merge checkpoints by cluster
+        checkpoint_fisher_matrices = {}
+
+        for model_folder, checkpoint_path in checkpoint_dict.items():
+            cluster = get_cluster(model_folder)
+            print(f"Adding checkpoint path for {model_folder} and {cluster}: {checkpoint_path}")
+            checkpoint_fisher_matrices[cluster] = {"checkpoint": checkpoint_path}
+
+        for model_folder, loaded_fisher in loaded_fishers.items():
+            cluster = get_cluster(model_folder)
+            if cluster not in checkpoint_fisher_matrices:
+                raise ValueError(f"Cluster key {cluster} not found in checkpoint_fisher_matrices")
+            checkpoint_fisher_matrices[cluster].update({"fisher": loaded_fisher})
+
+        weighted_checkpoint_list = []
+        fisher_list = []
+
+        for cluster, checkpoint_fisher_matrix in checkpoint_fisher_matrices.items():
+            if debug_mode: print(f"cluster name: {cluster}")
+            if debug_mode: print(f"matrix keys: {checkpoint_fisher_matrix.keys()}")      
+            checkpoint_path = checkpoint_fisher_matrix["checkpoint"]
+            
+            print(f"loading peft model {model_name} with adapter {checkpoint_path}")
+            checkpoint_model = load_peft_model(model_name, checkpoint_path)
+            checkpoint = checkpoint_model.state_dict()
+            checkpoint = {key: value.to('cpu') for key, value in checkpoint.items()}
+
+            print(f'Loaded checkpoint for {cluster}')
+            if debug_mode: debug_params(checkpoint_path, checkpoint)
+
+            fisher = checkpoint_fisher_matrix["fisher"]
+            fisher = set_minimum(fisher, 1e-8)
+
+            print(f'Loaded fisher for {cluster}')
+            if debug_mode: debug_params("fisher", fisher)
+
+            # Scale fishers
+            if len(checkpoint_dict) == 2:
+                if len(fisher_list) == 0:
+                    fisher = scale(fisher, model_lambda, select=select_params)
+                    if debug_mode: debug_params("scaled fisher", fisher)
+                else:
+                    assert len(fisher_list) == 1
+                    fisher = scale(fisher, (1 - model_lambda), select=select_params)
+                    if debug_mode: debug_params("scaled fisher", fisher)
+
+            weighted_cp = pairwise_param_map(
+                checkpoint, fisher, lambda x, y: x * y, select=select_params
+            )
+            if debug_mode: debug_params("weighted_cp", weighted_cp)
+
+            weighted_checkpoint_list.append(weighted_cp)
+            fisher_list.append(fisher)
+
+        weighted_cp_sum = scale_and_sum(weighted_checkpoint_list, 1, select=select_params)
+        if debug_mode: debug_params("weighted_cp_sum", weighted_cp_sum)
+        fisher_sum = scale_and_sum(fisher_list, 1, select=select_params)
+        if debug_mode: debug_params("fisher_sum", fisher_sum)
+
+        merged_model = divide(weighted_cp_sum, fisher_sum, select=select_params)
+
+        if debug_mode: debug_params("merged_model", merged_model)
+        selected_params_part = '-' + '-'.join(select_params)
+
+        # Construct the merged filename dynamically
+        merged_filename = (
+            f"{pretrained_model}"
+            f"{selected_params_part}"
+            f"-fisher-ep{epoch_num}"
+            f"-ml{int(model_lambda_factor)}" 
+            ".pt"
         )
-        if debug_mode: debug_params("weighted_cp", weighted_cp)
-        
-        weighted_checkpoint_list.append(weighted_cp)
-        fisher_list.append(fisher)
-        
-    weighted_cp_sum = scale_and_sum(weighted_checkpoint_list, 1, select=select_params)
-    if debug_mode: debug_params("weighted_cp_sum", weighted_cp_sum)
-    fisher_sum = scale_and_sum(fisher_list, 1, select=select_params)
-    if debug_mode: debug_params("fisher_sum", fisher_sum)
-   
-    merged_model = divide(weighted_cp_sum, fisher_sum, select=select_params)
+        merged_path = os.path.join('merged_models/', merged_filename)
+        torch.save(merged_model, merged_path)
+        print(f'Merged models and saved to {merged_path}')
     
-    if debug_mode: debug_params("merged_model", merged_model)
-    selected_params_part = '-' + '-'.join(select_params)
+    
+    # COMPARE: CONJUGATE GRADIENTS (MaTS)
+    # https://github.com/r-three/mats/blob/main/src/merging/conjugateGradient_diagonalFisher.py
+       
+    if use_conjugate_gradient:    
+        # Load fishers    
+        loaded_fishers = {}
+        for model_folder in checkpoint_dict.keys():
+            fisher_name = f"{model_folder}_fisher_ep{epoch_num}.pt"
+            fisher_path = os.path.join('fishers/', fisher_name)
+            fisher = torch.load(fisher_path, torch.device("cpu"))
+            loaded_fishers[model_folder] = fisher
+        if debug_mode: print(f"keys for loaded_fishers: {loaded_fishers.keys()}")
 
-    # Construct the merged filename dynamically
-    merged_filename = (
-        f"{pretrained_model}"
-        f"{selected_params_part}"
-        f"-fisher-ep{epoch_num}"
-        f"-ml{int(model_lambda_factor)}" 
-        ".pt"
-    )
-    merged_path = os.path.join('merged_models/', merged_filename)
-    torch.save(merged_model, merged_path)
-    print(f'Merged models and saved to {merged_path}')
+        checkpoint_gram_matrices = {}
+        all_param_names = None
+
+        for model_folder, checkpoint_path in checkpoint_dict.items():
+            cluster = get_cluster(model_folder)
+            print(f"Adding checkpoint path for {model_folder} and {cluster}: {checkpoint_path}")
+            checkpoint_gram_matrices[cluster] = {"checkpoint": checkpoint_path}
+
+        for model_folder, loaded_fisher in loaded_fishers.items():
+            cluster = get_cluster(model_folder)
+            if cluster not in checkpoint_gram_matrices:
+                raise ValueError(f"Cluster key {cluster} not found in checkpoint_fisher_matrices")
+            checkpoint_gram_matrices[cluster].update({"diagonal_fisher": loaded_fisher})
+            all_param_names = loaded_fisher.keys()
+
+        datasets_fishers = []
+        datasets_weights = []
+        datasets_fisher_times_weight = []
+        datasets_nonmerged_weights = []
+
+        for cluster, checkpoint_gram_matrix in checkpoint_gram_matrices.items():
+            if debug_mode: print(f"cluster name: {cluster}")
+            if debug_mode: print(f"matrix keys: {checkpoint_gram_matrix.keys()}")
+            checkpoint_path = checkpoint_gram_matrix["checkpoint"]
+            
+            print(f"loading peft model {model_name} with adapter {checkpoint_path}")
+            checkpoint_model = load_peft_model(model_name, checkpoint_path)
+            checkpoint = checkpoint_model.state_dict()
+            checkpoint = {key: value.to('cpu') for key, value in checkpoint.items()}
+
+            print(f'Loaded checkpoint for {cluster}')
+            if debug_mode: debug_params(checkpoint_path, checkpoint)
+
+            fisher_matrices = {}
+            weights = {}
+
+            for module_name, diag_fisher in checkpoint_gram_matrix["diagonal_fisher"].items():
+                param_name = module_name
+                weights[param_name] = checkpoint[param_name]
+                fisher_matrices[param_name] = diag_fisher
+
+            datasets_fishers.append(fisher_matrices)
+            datasets_weights.append(weights)
+
+            fisher_times_weight = element_wise_multiply(fisher_matrices, weights, select_params)
+            datasets_fisher_times_weight.append(fisher_times_weight)
+
+            nonmerged_weights = {}
+            for param_name, param in checkpoint.items():
+                if param_name not in fisher_matrices:
+                    nonmerged_weights[param_name] = param
+            datasets_nonmerged_weights.append(nonmerged_weights)
+
+        average_weights = scale_and_sum(datasets_weights, 1 / len(datasets_weights), select_params)
+
+        sum_fisher_matrices = scale_and_sum(datasets_fishers, 1, select_params)
+        sum_fisher_times_weight = scale_and_sum(datasets_fisher_times_weight, 1, select_params)
+
+        if initialization == "average":
+            init_model = average_weights
+        elif initialization == "pretrained":
+            init_model = pretrained_checkpoint
+        else:
+            if initialization is not None:
+                init_model = {}
+                # Transpose weights
+                for param_name, param in torch.load(initialization).items():
+                    init_model[param_name] = param
+            else:
+                init_model = None
+
+
+        final_model = conjugate_gradient_forward(
+            sum_fisher_matrices,
+            sum_fisher_times_weight,
+            init_model,
+            all_param_names,
+            num_iters
+        )
+
+        final_nonmerged_model = scale_and_sum(datasets_nonmerged_weights, 1 / len(datasets_nonmerged_weights), select_params)
+
+        for param_name, param in final_nonmerged_model.items():
+            final_model[param_name] = param
+
+        # Construct the merged filename dynamically
+        selected_params_part = '-' + '-'.join(select_params)
+        merged_filename = (
+            f"{pretrained_model}"
+            f"{selected_params_part}"
+            f"-cg-fisher-ep{epoch_num}"
+            f"-ml{int(model_lambda_factor)}" 
+            ".pt"
+        )
+        merged_path = os.path.join('merged_models/', merged_filename)
+        torch.save(final_model, merged_path)
+        print(f'Merged models and saved to {merged_path}')
