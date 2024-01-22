@@ -35,7 +35,7 @@ model_name = "meta-llama/Llama-2-7b-hf" # Also try "mistralai/Mistral-7B-v0.1"
 dataset = "instruct"
 cluster = "cedar"
 
-num_clusters = 2  # Adjust the number of clusters as needed
+num_clusters = 4  # Adjust the number of clusters as needed
 cluster_strategy = "embeddings"
 resume_from_cluster = 0
 
