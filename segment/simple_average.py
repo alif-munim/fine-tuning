@@ -6,7 +6,7 @@ from transformers import AutoModelForCausalLM
 from push_adapter import save_model
 
 # Define the model name pattern as a variable
-model_name_pattern = 'instruct-7b-r64-a16'
+model_name_pattern = 'guanaco-7b-r64-a16'
 
 # Define a function to find LoRA weight keys
 def find_lora_weight_keys(state_dict):
@@ -20,7 +20,7 @@ model_dirs = [d for d in os.listdir('.') if model_name_pattern in d and 'cluster
 base_model_name = "meta-llama/Llama-2-7b-hf"
 base_model = AutoModelForCausalLM.from_pretrained(base_model_name, torch_dtype=torch.float32)
 
-select_groups = [4]
+select_groups = [2, 4]
 epoch_num = 3
 epoch_path = f"epoch_{epoch_num}"
 
@@ -68,8 +68,8 @@ for group in set(match.group(1) for d in model_dirs if (match := pattern.match(d
         print(f'Finished processing group {group}.')
 
 
-print(f"Merging averaged adapter weights into base model {base_model_name}...")
-output_dir = f'{model_name_pattern}-{group}-sa-ep{epoch_num}-model'
-adapter_path = avg_adapter_dir
-save_model("adapter", base_model_name, adapter_path, output_dir)
-print(f"Successfully saved averaged model at {output_dir}!")
+    print(f"Merging averaged adapter weights into base model {base_model_name}...")
+    output_dir = f'{model_name_pattern}-{group}-sa-ep{epoch_num}-model'
+    adapter_path = avg_adapter_dir
+    save_model("adapter", base_model_name, adapter_path, output_dir)
+    print(f"Successfully saved averaged model at {output_dir}!")

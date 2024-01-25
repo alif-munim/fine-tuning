@@ -15,3 +15,5 @@ mats/
 segment/segment.ipynb
 segment/test
 *.pt
+*-7b-*
+data/
