@@ -65,8 +65,38 @@ if cluster == "narval":
     
 ### GRADIENTS ###
 
+def aggregate_gradients_for_batch(batch, tokenizer, model, max_length=None):
+    # Check if tokenizer has a padding token, if not, set it to the eos_token
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # Tokenize the batch
+    inputs = tokenizer(batch, return_tensors='pt', padding=True, max_length=max_length, truncation=True)
+    inputs = {k: v.to("cuda") for k, v in inputs.items()}
 
-def compute_gradients_for_batch(batch, tokenizer, model, max_length=None):
+    model.zero_grad()
+    # Forward pass with batched inputs
+    outputs = model(**inputs, labels=inputs['input_ids'])
+    loss = outputs.loss
+    # Backward pass for the entire batch
+    loss.backward()
+
+    # Collect gradients for the entire batch from the last layer
+    batch_gradients = []
+    for name, parameter in model.named_parameters():
+        if "lm_head" in name and parameter.requires_grad and parameter.grad is not None:
+            # Reshape gradients to (batch_size, -1), we do not detach and move to CPU yet
+            batch_gradients.append(parameter.grad.view(inputs['input_ids'].shape[0], -1))
+    
+    # Concatenate the gradients for the batch along the second dimension
+    # (batch_size, sum_of_all_gradients_dimensions)
+    all_gradients = torch.cat(batch_gradients, dim=1).detach().cpu().numpy()
+
+    # Return a numpy array of shape (batch_size, num_gradients_per_example)
+    return all_gradients
+
+
+def stack_gradients_for_batch(batch, tokenizer, model, max_length=None):
     # Check if tokenizer has a padding token, if not, set it to the eos_token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -122,22 +152,36 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
     n_components = batch_size
 
     # Initialize IncrementalPCA
-    ipca = IncrementalPCA(n_components=n_components, batch_size=batch_size)
+    ipca = IncrementalPCA(n_components=n_components)
 
-    for i in tqdm(range(0, len(dataset['text']), batch_size), desc='Computing gradients for partial IPCA fit'):
-        end_idx = min(i+batch_size, len(dataset['text']))
+    gradient_buffer = []
+    gradient_buffer_size = 16  # The desired buffer size
+
+    # Process gradients in batches and accumulate in buffer
+    for i in tqdm(range(0, len(dataset['text']), batch_size), desc='Computing gradients'):
+        end_idx = min(i + batch_size, len(dataset['text']))
         batch_texts = dataset['text'][i:end_idx]
-        batch_gradients = compute_gradients_for_batch(batch_texts, tokenizer, model, max_length)
-        ipca.partial_fit(batch_gradients)
+        batch_gradients = aggregate_gradients_for_batch(batch_texts, tokenizer, model, max_length)
 
-    # Convert the list of batch gradient arrays into a single array
-    # gradient_features = np.vstack(gradient_features)
+        # Append gradients to buffer
+        gradient_buffer.append(batch_gradients)
+
+        # If buffer has enough elements, perform partial_fit
+        if len(gradient_buffer) == gradient_buffer_size:
+            gradients_to_fit = np.vstack(gradient_buffer)
+            ipca.partial_fit(gradients_to_fit)
+            gradient_buffer = []  # Clear the buffer
+
+    # If there are any remaining gradients in the buffer after loop, fit them as well
+    if gradient_buffer:
+        gradients_to_fit = np.vstack(gradient_buffer)
+        ipca.partial_fit(gradients_to_fit)
     
     reduced_gradients = []
     for i in tqdm(range(0, len(train_dataset), batch_size), desc='Reducing gradients with IPCA transform'):
         end_idx = min(i+batch_size, len(dataset['text']))
         batch_texts = dataset['text'][i:end_idx]
-        batch_gradients = compute_gradients_for_batch(batch_texts, tokenizer, model, max_length)
+        batch_gradients = stack_gradients_for_batch(batch_texts, tokenizer, model, max_length)
         reduced_gradients_batch = ipca.transform(batch_gradients)
         reduced_gradients.append(reduced_gradients_batch)
     
@@ -195,8 +239,8 @@ if cluster_strategy == "embeddings":
 elif cluster_strategy == "tfid":
     clustered_data = cluster_tfid(train_dataset, num_clusters)
 elif cluster_strategy == "gradients":
-    batch_size = 16
-    max_length = 512
+    batch_size = 4
+    max_length = 128
     clustered_data = cluster_gradients(train_dataset, num_clusters, batch_size, max_length)
     save_path = f"gradient_clusters_{num_clusters}.csv" 
     clustered_data.to_csv(save_path)
