@@ -27,6 +27,8 @@ import numpy as np
 from itertools import islice
 from tqdm.auto import tqdm
 
+from sklearn.decomposition import IncrementalPCA
+
 def preprocess_instruct(examples):
     # Concatenate 'prompt' and 'completion' fields
     texts = [prompt + " " + completion for prompt, completion in zip(examples['prompt'], examples['completion'])]
@@ -72,22 +74,29 @@ def compute_gradients_for_batch(batch, tokenizer, model, max_length=None):
     # Tokenize the batch
     inputs = tokenizer(batch, return_tensors='pt', padding=True, max_length=max_length, truncation=True)
     inputs = {k: v.to("cuda") for k, v in inputs.items()}
-    
-    # Forward pass
-    outputs = model(**inputs, labels=inputs['input_ids'])
-    loss = outputs.loss
-    model.zero_grad()
-    
-    # Backward pass to get gradients
-    loss.backward()
-    
-    # Collect gradients
-    gradients = []
-    for name, parameter in model.named_parameters():
-        if parameter.requires_grad and parameter.grad is not None:
-            gradients.append(parameter.grad.detach().cpu().numpy().flatten())
-    return np.concatenate(gradients)
 
+    # Forward pass in a loop for each example to get individual gradients
+    gradients_list = []
+    for i in range(inputs['input_ids'].shape[0]):
+        model.zero_grad()
+        outputs = model(**{k: v[i:i+1] for k, v in inputs.items()}, labels=inputs['input_ids'][i:i+1])
+        loss = outputs.loss
+        loss.backward()
+
+        # Collect gradients for the current example from the last layer
+        example_gradients = []
+        for name, parameter in model.named_parameters():
+            if "lm_head" in name and parameter.requires_grad and parameter.grad is not None:
+                # Note: We're not detaching and moving to CPU here
+                example_gradients.append(parameter.grad.view(-1))
+        # Concatenate the gradients for the current example and keep on GPU
+        gradients_list.append(torch.cat(example_gradients))
+
+    # Stack the gradients, detach and move the entire tensor to CPU at once
+    all_gradients = torch.stack(gradients_list).detach().cpu().numpy()
+
+    # Return a numpy array of shape (batch_size, num_gradients_per_example)
+    return all_gradients
 
 #### CLUSTERING #########
 
@@ -108,21 +117,33 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
     # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # model.to(device)
     model.eval()
+    
+    # For PCA, n_components must be less or equal to batch_size
+    n_components = batch_size
 
-    # Computing gradients for the dataset in batches
-    gradient_features = []
-    for i in tqdm(range(0, len(train_dataset), batch_size), desc='Computing gradients'):
-        batch_texts = train_dataset['text'][i:i+batch_size]
-        batch_gradients = compute_gradients_for_batch(batch_texts, tokenizer, model, max_length)       
-        gradient_features.append(batch_gradients)
-        model.zero_grad()  # Important to clear gradients after processing each batch
+    # Initialize IncrementalPCA
+    ipca = IncrementalPCA(n_components=n_components, batch_size=batch_size)
+
+    for i in tqdm(range(0, len(dataset['text']), batch_size), desc='Computing gradients for partial IPCA fit'):
+        end_idx = min(i+batch_size, len(dataset['text']))
+        batch_texts = dataset['text'][i:end_idx]
+        batch_gradients = compute_gradients_for_batch(batch_texts, tokenizer, model, max_length)
+        ipca.partial_fit(batch_gradients)
 
     # Convert the list of batch gradient arrays into a single array
-    gradient_features = np.vstack(gradient_features)
+    # gradient_features = np.vstack(gradient_features)
+    
+    reduced_gradients = []
+    for i in tqdm(range(0, len(train_dataset), batch_size), desc='Reducing gradients with IPCA transform'):
+        end_idx = min(i+batch_size, len(dataset['text']))
+        batch_texts = dataset['text'][i:end_idx]
+        batch_gradients = compute_gradients_for_batch(batch_texts, tokenizer, model, max_length)
+        reduced_gradients_batch = ipca.transform(batch_gradients)
+        reduced_gradients.append(reduced_gradients_batch)
     
     # Cluster the gradient features
     kmeans = KMeans(n_clusters=num_clusters, random_state=0)
-    kmeans.fit(gradient_features)
+    kmeans.fit(reduced_gradients)
     cluster_labels = kmeans.labels_
 
     # Create the clustered dataset
@@ -174,8 +195,8 @@ if cluster_strategy == "embeddings":
 elif cluster_strategy == "tfid":
     clustered_data = cluster_tfid(train_dataset, num_clusters)
 elif cluster_strategy == "gradients":
-    batch_size = 6
-    max_length = 1024
+    batch_size = 16
+    max_length = 512
     clustered_data = cluster_gradients(train_dataset, num_clusters, batch_size, max_length)
     save_path = f"gradient_clusters_{num_clusters}.csv" 
     clustered_data.to_csv(save_path)
