@@ -28,6 +28,7 @@ from itertools import islice
 from tqdm.auto import tqdm
 
 from sklearn.decomposition import IncrementalPCA
+from joblib import dump, load
 
 def preprocess_instruct(examples):
     # Concatenate 'prompt' and 'completion' fields
@@ -86,7 +87,8 @@ def aggregate_gradients_for_batch(batch, tokenizer, model, max_length=None):
     for name, parameter in model.named_parameters():
         if "lm_head" in name and parameter.requires_grad and parameter.grad is not None:
             # Reshape gradients to (batch_size, -1), we do not detach and move to CPU yet
-            batch_gradients.append(parameter.grad.view(inputs['input_ids'].shape[0], -1))
+            batch_grads_float32 = parameter.grad.view(inputs['input_ids'].shape[0], -1).to(dtype=torch.float32)
+            batch_gradients.append(batch_grads_float32)
     
     # Concatenate the gradients for the batch along the second dimension
     # (batch_size, sum_of_all_gradients_dimensions)
@@ -118,7 +120,8 @@ def stack_gradients_for_batch(batch, tokenizer, model, max_length=None):
         for name, parameter in model.named_parameters():
             if "lm_head" in name and parameter.requires_grad and parameter.grad is not None:
                 # Note: We're not detaching and moving to CPU here
-                example_gradients.append(parameter.grad.view(-1))
+                example_grads_float32 = parameter.grad.view(-1).to(dtype=torch.float32)
+                example_gradients.append(example_grads_float32)
         # Concatenate the gradients for the current example and keep on GPU
         gradients_list.append(torch.cat(example_gradients))
 
@@ -152,7 +155,7 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
     n_components = batch_size
 
     # Initialize IncrementalPCA
-    ipca = IncrementalPCA(n_components=n_components)
+    ipca = IncrementalPCA(n_components=n_components, batch_size=batch_size)
 
     gradient_buffer = []
     gradient_buffer_size = 16  # The desired buffer size
@@ -175,8 +178,14 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
     # If there are any remaining gradients in the buffer after loop, fit them as well
     if gradient_buffer:
         gradients_to_fit = np.vstack(gradient_buffer)
-        ipca.partial_fit(gradients_to_fit)
+        ipca.partial_fit(gradients_to_fit) 
+        
+    dump(ipca, 'ipca_model.joblib')
+
+    # Convert the list of batch gradient arrays into a single array
+    # gradient_features = np.vstack(gradient_features)
     
+    ipca = load('ipca_model.joblib')
     reduced_gradients = []
     for i in tqdm(range(0, len(train_dataset), batch_size), desc='Reducing gradients with IPCA transform'):
         end_idx = min(i+batch_size, len(dataset['text']))
@@ -239,8 +248,8 @@ if cluster_strategy == "embeddings":
 elif cluster_strategy == "tfid":
     clustered_data = cluster_tfid(train_dataset, num_clusters)
 elif cluster_strategy == "gradients":
-    batch_size = 4
-    max_length = 128
+    batch_size = 16
+    max_length = 512
     clustered_data = cluster_gradients(train_dataset, num_clusters, batch_size, max_length)
     save_path = f"gradient_clusters_{num_clusters}.csv" 
     clustered_data.to_csv(save_path)
