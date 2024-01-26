@@ -2,6 +2,7 @@ import os
 import math
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
 
 from datasets import load_dataset, Dataset
 from transformers import (
@@ -14,6 +15,7 @@ from transformers import (
     pipeline,
     logging,
     TrainerCallback,
+    DataCollatorForLanguageModeling
 )
 from peft import LoraConfig, PeftModel
 from trl import SFTTrainer
@@ -29,6 +31,8 @@ from tqdm.auto import tqdm
 
 from sklearn.decomposition import IncrementalPCA
 from joblib import dump, load
+import gc
+from functools import partial
 
 def preprocess_instruct(examples):
     # Concatenate 'prompt' and 'completion' fields
@@ -63,39 +67,71 @@ if cluster == "narval":
         train_dataset = train_dataset.map(preprocess_instruct, batched=True)
     print(f"Training dataset set to: {dataset} from local path: {dataset_path}")
     
+### TOKENIZATION ####
+
+# Tokenize the dataset
+def tokenize_function(examples, tokenizer, max_length):
+    return tokenizer(
+        examples["text"],
+        # example["prompt"],
+        # example["completion"],
+        truncation=True,       # truncate to the model's max length
+        max_length=max_length,        # max length for the tokens
+        padding="max_length",  # add padding to the tokens
+        return_tensors="pt"    # return PyTorch tensors
+    )
+
+def shift_labels_right(examples):
+    examples['labels'] = examples['input_ids'].copy()
+    examples['labels'] = [x[1:] + [-100] for x in examples['labels']]
+    return examples
+    
+def get_tokenized_dataloader(tokenized_dataset, tokenizer, batch_size):
+    data_collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False  # Set to False for CLM
+    )
+    dataloader = DataLoader(
+        tokenized_dataset, 
+        batch_size=batch_size, 
+        collate_fn=data_collator 
+    )
+    
+    return dataloader
+
+    
     
 ### GRADIENTS ###
 
-def aggregate_gradients_for_batch(batch, tokenizer, model, max_length=None):
+def aggregate_gradients_for_batch(batch, model, max_length=None):
     # Check if tokenizer has a padding token, if not, set it to the eos_token
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+#     if tokenizer.pad_token is None:
+#         tokenizer.pad_token = tokenizer.eos_token
     
-    # Tokenize the batch
-    inputs = tokenizer(batch, return_tensors='pt', padding=True, max_length=max_length, truncation=True)
-    inputs = {k: v.to("cuda") for k, v in inputs.items()}
+#     # Tokenize the batch
+#     inputs = tokenizer(batch, return_tensors='pt', padding=True, max_length=max_length, truncation=True)
+#     inputs = {k: v.to("cuda") for k, v in inputs.items()}
 
+    batch = {k: v.to("cuda") for k, v in batch.items()}
     model.zero_grad()
-    # Forward pass with batched inputs
-    outputs = model(**inputs, labels=inputs['input_ids'])
+    outputs = model(**batch)
     loss = outputs.loss
-    # Backward pass for the entire batch
     loss.backward()
 
     # Collect gradients for the entire batch from the last layer
+    gradients_list = []
     batch_gradients = []
     for name, parameter in model.named_parameters():
         if "lm_head" in name and parameter.requires_grad and parameter.grad is not None:
-            # Reshape gradients to (batch_size, -1), we do not detach and move to CPU yet
-            batch_grads_float32 = parameter.grad.view(inputs['input_ids'].shape[0], -1).to(dtype=torch.float32) # leads to stacking along batch dimension
-            # batch_grads_float32 = parameter.grad.view(-1).to(dtype=torch.float32) # leads to collapsing into 1 long tensor
+            # Note: We're not detaching and moving to CPU here
+            batch_grads_float32 = parameter.grad.view(-1).to(dtype=torch.float32)
             batch_gradients.append(batch_grads_float32)
-    
-    # Concatenate the gradients for the batch along the second dimension
-    # (batch_size, sum_of_all_gradients_dimensions)
-    # all_gradients = torch.cat(batch_gradients, dim=1).detach().cpu().numpy()
-    all_gradients = torch.stack(batch_gradients).detach().cpu().numpy()
-    
+    # Concatenate the gradients for the current example and keep on GPU
+    gradients_list.append(torch.cat(batch_gradients))
+
+    # Stack the gradients, detach and move the entire tensor to CPU at once
+    all_gradients = torch.stack(gradients_list).detach().cpu().numpy()
+
     # Return a numpy array of shape (batch_size, num_gradients_per_example)
     return all_gradients
 
@@ -133,6 +169,9 @@ def stack_gradients_for_batch(batch, tokenizer, model, max_length=None):
     # Return a numpy array of shape (batch_size, num_gradients_per_example)
     return all_gradients
 
+
+
+
 def manage_ipca_checkpoints(ipca_model_name, step_count, ipca, max_checkpoints=10):
     # Pattern to match the checkpoint files
     checkpoint_pattern = f"{ipca_model_name}_*.joblib"
@@ -160,9 +199,12 @@ def manage_ipca_checkpoints(ipca_model_name, step_count, ipca, max_checkpoints=1
 
 def cluster_gradients(dataset, num_clusters, batch_size, max_length):
 
+    # For PCA, n_components must be less or equal to batch_size
+    batch_size = 16
+    n_components = batch_size
+    
     # Load the model and tokenizer
     model_name = "meta-llama/Llama-2-7b-hf"  # replace with your model
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         low_cpu_mem_usage=True,
@@ -170,19 +212,37 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
         torch_dtype=torch.float16,
         device_map="auto",
     )
+    
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+    
+    tokenized_dataset = dataset.map(
+        partial(tokenize_function, tokenizer=tokenizer, max_length=max_length), 
+        batched=True,
+    )
+    tokenized_dataset = tokenized_dataset.map(
+        lambda examples: {'input_ids': examples['input_ids'], 'attention_mask': examples['attention_mask']},
+        batched=True,
+        remove_columns=tokenized_dataset.column_names  # This removes all columns except the ones specified above
+    )
+    tokenized_dataset = tokenized_dataset.map(shift_labels_right, batched=True)
+    print(f"Tokenized dataset length: {len(tokenized_dataset)}")
+    
+    dataloader = get_tokenized_dataloader(tokenized_dataset, tokenizer, batch_size)
+    iterator = iter(dataloader)
+    batch = next(iterator)
+    
 
     # Set the model to evaluation mode and to the device
     # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # model.to(device)
     model.eval()
-    
-    # For PCA, n_components must be less or equal to batch_size
-    batch_size = 16
-    n_components = batch_size
 
     # Initialize IncrementalPCA
     ipca = IncrementalPCA(n_components=n_components, batch_size=batch_size)
 
+    grad_batching = "aggregate"
     gradient_buffer = []
     gradient_buffer_size = 1  # The desired buffer size
     expected_batch_size = batch_size
@@ -197,24 +257,47 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
     ipca_checkpoint_step = 616
     ipca_checkpoint = f"{ipca_model_name}_{ipca_checkpoint_step}.joblib"   
     
-    end_idx = min(0 + batch_size, len(dataset['text']))
-    batch_texts = dataset['text'][0:end_idx]
-    batch_gradients = stack_gradients_for_batch(batch_texts, tokenizer, model, max_length)
-    gradient_buffer.append(batch_gradients)
+    # end_idx = min(0 + batch_size, len(dataset['text']))
+    # batch_texts = dataset['text'][0:end_idx]
+    
+    dataloader = get_tokenized_dataloader(tokenized_dataset, tokenizer, batch_size)
+    iterator = iter(dataloader)
+    
+    for i in range(16):
+        batch = next(iterator)
+        if grad_batching == "stack":
+            batch_gradients = stack_gradients_for_batch(batch, model, max_length)
+        elif grad_batching == "aggregate":
+            batch_gradients = aggregate_gradients_for_batch(batch,model, max_length)
+        gradient_buffer.append(batch_gradients)
+        
     gradient_list = np.vstack(gradient_buffer)
     print(f"gradient_list (batch): {gradient_list.shape}")
     ipca.partial_fit(gradient_list)
     gradient_buffer = [] 
     
     example_batch_size = 1
-    end_idx = min(0 + example_batch_size, len(dataset['text']))
-    example_batch_texts = dataset['text'][0:end_idx]
-    example_gradients = stack_gradients_for_batch(example_batch_texts, tokenizer, model, max_length)
+    # end_idx = min(0 + example_batch_size, len(dataset['text']))
+    # example_batch_texts = dataset['text'][0:end_idx]
+    dataloader = get_tokenized_dataloader(tokenized_dataset, tokenizer, example_batch_size)
+    iterator = iter(dataloader)
+    batch = next(iterator)
+    
+    if grad_batching == "stack":
+        example_gradients = stack_gradients_for_batch(batch, model, max_length)
+    elif grad_batching == "aggregate":
+        example_gradients = aggregate_gradients_for_batch(batch, model, max_length)
+        
     gradient_buffer.append(example_gradients)
     gradient_list = np.vstack(gradient_buffer)
     print(f"gradient_list (reduced example): {gradient_list.shape}")
     reduced_gradients_batch = ipca.transform(gradient_list)
-    gradient_buffer = [] 
+    
+    gradient_buffer = []  # Clear the buffer
+    del gradient_list  # Delete the variable holding the tensor
+    del gradient_buffer
+    torch.cuda.empty_cache()  # Release GPU memory
+    gc.collect()
     
     
     print(f"""
@@ -228,6 +311,7 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
         Batch Size: {batch_size}
         Gradient Shape: {batch_gradients.shape}
         Reduced Gradient Shape: {reduced_gradients_batch.shape}
+        Gradient Batching: {grad_batching}
     """)
     
     
@@ -250,8 +334,12 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
                     print(f"Skipping a batch with size {len(batch_texts)} which is smaller than the expected size {expected_batch_size}.")
                     continue
                 else:
-                    batch_gradients = stack_gradients_for_batch(batch_texts, tokenizer, model, max_length)
+                    if grad_batching == "stack":
+                        batch_gradients = stack_gradients_for_batch(batch_texts, tokenizer, model, max_length)
+                    elif grad_batching == "aggregate":
+                        batch_gradients = aggregate_gradients_for_batch(batch_texts, tokenizer, model, max_length)
                     gradient_buffer.append(batch_gradients) # Append batch_size (16) gradients to the buffer
+                    print(f"Length of gradient buffer (after appending once): {len(gradient_buffer)}")
 
                     # If buffer has enough elements, perform partial_fit
                     if len(gradient_buffer) == gradient_buffer_size:
@@ -264,6 +352,7 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
                         del gradient_buffer
                         torch.cuda.empty_cache()  # Release GPU memory
                         gc.collect()
+                        print(f"Length of gradient buffer (after fit & clear): {len(gradient_buffer)}")
 
         print(f"{step_count}/{total_steps}: saving PCA at ipca_model_{step_count}.joblib")
         last_saved_pca = f"{ipca_model_name}_{step_count}.joblib"
@@ -279,7 +368,10 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
     for i in tqdm(range(0, len(train_dataset), batch_size), desc='Reducing gradients with IPCA transform'):
         end_idx = min(0 + example_batch_size, len(dataset['text']))
         example_batch_texts = dataset['text'][0:end_idx]
-        example_gradients = stack_gradients_for_batch(example_batch_texts, tokenizer, model, max_length)
+        if grad_batching == "stack":
+            example_gradients = stack_gradients_for_batch(example_batch_texts, tokenizer, model, max_length)
+        elif grad_batching == "aggregate":
+            example_gradients = aggregate_gradients_for_batch(example_batch_texts, tokenizer, model, max_length)
         gradient_buffer.append(example_gradients)
         gradient_list = np.vstack(gradient_buffer)
         reduced_gradients_batch = ipca.transform(gradient_list)
@@ -345,7 +437,7 @@ elif cluster_strategy == "tfid":
     clustered_data = cluster_tfid(train_dataset, num_clusters)
 elif cluster_strategy == "gradients":
     batch_size = 1
-    max_length = 512
+    max_length = 64
     clustered_data = cluster_gradients(train_dataset, num_clusters, batch_size, max_length)
     save_path = f"gradient_clusters_{num_clusters}.csv" 
     clustered_data.to_csv(save_path)
