@@ -87,13 +87,15 @@ def aggregate_gradients_for_batch(batch, tokenizer, model, max_length=None):
     for name, parameter in model.named_parameters():
         if "lm_head" in name and parameter.requires_grad and parameter.grad is not None:
             # Reshape gradients to (batch_size, -1), we do not detach and move to CPU yet
-            batch_grads_float32 = parameter.grad.view(inputs['input_ids'].shape[0], -1).to(dtype=torch.float32)
+            batch_grads_float32 = parameter.grad.view(inputs['input_ids'].shape[0], -1).to(dtype=torch.float32) # leads to stacking along batch dimension
+            # batch_grads_float32 = parameter.grad.view(-1).to(dtype=torch.float32) # leads to collapsing into 1 long tensor
             batch_gradients.append(batch_grads_float32)
     
     # Concatenate the gradients for the batch along the second dimension
     # (batch_size, sum_of_all_gradients_dimensions)
-    all_gradients = torch.cat(batch_gradients, dim=1).detach().cpu().numpy()
-
+    # all_gradients = torch.cat(batch_gradients, dim=1).detach().cpu().numpy()
+    all_gradients = torch.stack(batch_gradients).detach().cpu().numpy()
+    
     # Return a numpy array of shape (batch_size, num_gradients_per_example)
     return all_gradients
 
@@ -131,6 +133,29 @@ def stack_gradients_for_batch(batch, tokenizer, model, max_length=None):
     # Return a numpy array of shape (batch_size, num_gradients_per_example)
     return all_gradients
 
+def manage_ipca_checkpoints(ipca_model_name, step_count, ipca, max_checkpoints=10):
+    # Pattern to match the checkpoint files
+    checkpoint_pattern = f"{ipca_model_name}_*.joblib"
+    
+    # Find all existing checkpoint files
+    existing_checkpoints = glob.glob(checkpoint_pattern)
+    
+    # Sort the files by their step count, extracted from the filename
+    sorted_checkpoints = sorted(existing_checkpoints, key=lambda x: int(x.split('_')[-1].split('.')[0]))
+    
+    # If we have more checkpoints than the max allowed, remove the oldest ones
+    while len(sorted_checkpoints) >= max_checkpoints:
+        os.remove(sorted_checkpoints.pop(0))  # Remove the oldest checkpoint
+    
+    # Save the new checkpoint
+    last_saved_pca = f"{ipca_model_name}_{step_count}.joblib"
+    dump(ipca, last_saved_pca)
+    
+    # Add the new checkpoint to the list
+    sorted_checkpoints.append(last_saved_pca)
+    
+    print(f"{step_count}: saving PCA at {last_saved_pca}. There are {len(sorted_checkpoints)} checkpoints saved.")
+
 #### CLUSTERING #########
 
 def cluster_gradients(dataset, num_clusters, batch_size, max_length):
@@ -152,47 +177,118 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
     model.eval()
     
     # For PCA, n_components must be less or equal to batch_size
+    batch_size = 16
     n_components = batch_size
 
     # Initialize IncrementalPCA
     ipca = IncrementalPCA(n_components=n_components, batch_size=batch_size)
 
     gradient_buffer = []
-    gradient_buffer_size = 16  # The desired buffer size
+    gradient_buffer_size = 1  # The desired buffer size
+    expected_batch_size = batch_size
+    step_count = 0
+    total_steps = len(dataset['text']) // batch_size
 
-    # Process gradients in batches and accumulate in buffer
-    for i in tqdm(range(0, len(dataset['text']), batch_size), desc='Computing gradients'):
-        end_idx = min(i + batch_size, len(dataset['text']))
-        batch_texts = dataset['text'][i:end_idx]
-        batch_gradients = aggregate_gradients_for_batch(batch_texts, tokenizer, model, max_length)
-
-        # Append gradients to buffer
-        gradient_buffer.append(batch_gradients)
-
-        # If buffer has enough elements, perform partial_fit
-        if len(gradient_buffer) == gradient_buffer_size:
-            gradients_to_fit = np.vstack(gradient_buffer)
-            ipca.partial_fit(gradients_to_fit)
-            gradient_buffer = []  # Clear the buffer
-
-    # If there are any remaining gradients in the buffer after loop, fit them as well
-    if gradient_buffer:
-        gradients_to_fit = np.vstack(gradient_buffer)
-        ipca.partial_fit(gradients_to_fit) 
+    compute_pca = True
+    ipca_save_step = 5
+    
+    load_ipca_checkpoint = False
+    ipca_model_name = "b1_lmhead_ipca" # ["ipca_model", "b1_lmhead_ipca"]
+    ipca_checkpoint_step = 616
+    ipca_checkpoint = f"{ipca_model_name}_{ipca_checkpoint_step}.joblib"   
+    
+    end_idx = min(0 + batch_size, len(dataset['text']))
+    batch_texts = dataset['text'][0:end_idx]
+    batch_gradients = stack_gradients_for_batch(batch_texts, tokenizer, model, max_length)
+    gradient_buffer.append(batch_gradients)
+    gradient_list = np.vstack(gradient_buffer)
+    print(f"gradient_list (batch): {gradient_list.shape}")
+    ipca.partial_fit(gradient_list)
+    gradient_buffer = [] 
+    
+    example_batch_size = 1
+    end_idx = min(0 + example_batch_size, len(dataset['text']))
+    example_batch_texts = dataset['text'][0:end_idx]
+    example_gradients = stack_gradients_for_batch(example_batch_texts, tokenizer, model, max_length)
+    gradient_buffer.append(example_gradients)
+    gradient_list = np.vstack(gradient_buffer)
+    print(f"gradient_list (reduced example): {gradient_list.shape}")
+    reduced_gradients_batch = ipca.transform(gradient_list)
+    gradient_buffer = [] 
+    
+    
+    print(f"""
+        Starting Incremental PCA training with the following configs
         
-    dump(ipca, 'ipca_model.joblib')
+        Compute IPCA: {compute_pca}
+        Load IPCA Checkpoint: {load_ipca_checkpoint}
+        IPCA Checkpoint Path: {ipca_checkpoint}
+        IPCA Save Steps: {ipca_save_step}
+        Num Components: {n_components}
+        Batch Size: {batch_size}
+        Gradient Shape: {batch_gradients.shape}
+        Reduced Gradient Shape: {reduced_gradients_batch.shape}
+    """)
+    
+    
+    if load_ipca_checkpoint:
+        ipca = load(ipca_checkpoint)
+      
+    if compute_pca:
+        # Process gradients in batches and accumulate in buffer
+        for i in tqdm(range(0, len(dataset['text']), batch_size), desc='Estimating PCA model from gradients...'):
+
+            step_count += 1
+            if (load_ipca_checkpoint and step_count > ipca_checkpoint_step) or not load_ipca_checkpoint:
+                if step_count % ipca_save_step == 0:
+                    manage_ipca_checkpoints(ipca_model_name, step_count, ipca)
+
+                end_idx = min(i + batch_size, len(dataset['text']))
+                batch_texts = dataset['text'][i:end_idx]
+
+                if len(batch_texts) < expected_batch_size:
+                    print(f"Skipping a batch with size {len(batch_texts)} which is smaller than the expected size {expected_batch_size}.")
+                    continue
+                else:
+                    batch_gradients = stack_gradients_for_batch(batch_texts, tokenizer, model, max_length)
+                    gradient_buffer.append(batch_gradients) # Append batch_size (16) gradients to the buffer
+
+                    # If buffer has enough elements, perform partial_fit
+                    if len(gradient_buffer) == gradient_buffer_size:
+                        print(f"Gradient buffer size: {len(gradient_buffer)}")
+                        # Why isn't the buffer clearing properly?
+                        gradient_list = np.vstack(gradient_buffer) # Unable to allocate 125. GiB for an array with shape (256, 131072000) and data type float32
+                        ipca.partial_fit(gradient_list) # NOTE: accumulate more gradients before fit to speed up computation
+                        gradient_buffer = []  # Clear the buffer
+                        del gradient_list  # Delete the variable holding the tensor
+                        del gradient_buffer
+                        torch.cuda.empty_cache()  # Release GPU memory
+                        gc.collect()
+
+        print(f"{step_count}/{total_steps}: saving PCA at ipca_model_{step_count}.joblib")
+        last_saved_pca = f"{ipca_model_name}_{step_count}.joblib"
+        dump(ipca, last_saved_pca)
 
     # Convert the list of batch gradient arrays into a single array
     # gradient_features = np.vstack(gradient_features)
-    
-    ipca = load('ipca_model.joblib')
+
+    gradient_buffer = []
     reduced_gradients = []
+    example_batch_size = 1
+    
     for i in tqdm(range(0, len(train_dataset), batch_size), desc='Reducing gradients with IPCA transform'):
-        end_idx = min(i+batch_size, len(dataset['text']))
-        batch_texts = dataset['text'][i:end_idx]
-        batch_gradients = stack_gradients_for_batch(batch_texts, tokenizer, model, max_length)
-        reduced_gradients_batch = ipca.transform(batch_gradients)
+        end_idx = min(0 + example_batch_size, len(dataset['text']))
+        example_batch_texts = dataset['text'][0:end_idx]
+        example_gradients = stack_gradients_for_batch(example_batch_texts, tokenizer, model, max_length)
+        gradient_buffer.append(example_gradients)
+        gradient_list = np.vstack(gradient_buffer)
+        reduced_gradients_batch = ipca.transform(gradient_list)
         reduced_gradients.append(reduced_gradients_batch)
+        gradient_buffer = []
+        
+    stacked_gradients = np.stack(arrays_list, axis=0)
+    np.save('reduced_gradients_stack.npy', stacked_gradients)
+    print(f"Saved reduced gradients with shape {stacked_gradients.shape} to reduced_gradients_stack.npy")
     
     # Cluster the gradient features
     kmeans = KMeans(n_clusters=num_clusters, random_state=0)
@@ -248,7 +344,7 @@ if cluster_strategy == "embeddings":
 elif cluster_strategy == "tfid":
     clustered_data = cluster_tfid(train_dataset, num_clusters)
 elif cluster_strategy == "gradients":
-    batch_size = 16
+    batch_size = 1
     max_length = 512
     clustered_data = cluster_gradients(train_dataset, num_clusters, batch_size, max_length)
     save_path = f"gradient_clusters_{num_clusters}.csv" 
