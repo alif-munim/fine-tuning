@@ -236,10 +236,10 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
     gradient_buffer_size = batch_size  # The desired buffer size
     expected_batch_size = batch_size
 
-    compute_pca = True
+    compute_pca = False
     load_ipca_checkpoint = True
     ipca_model_name = f"bs{batch_size}_ml{max_length}_lmhead_ipca" # ["ipca_model", "b1_lmhead_ipca"]
-    ipca_checkpoint_step = 98
+    ipca_checkpoint_step = 1231
     ipca_checkpoint = f"{ipca_model_name}_{ipca_checkpoint_step}.joblib" 
     
     print(f"""
@@ -320,7 +320,7 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
         
     stacked_gradients = np.stack(reduced_gradients, axis=0)
     stacked_gradients = stacked_gradients.squeeze(axis=1)
-    np.save('reduced_gradients_stack.npy', stacked_gradients) # Save reduced gradients for different num clusters later
+    np.save(f"reduced_gradients_stack_bs{batch_size}.npy", stacked_gradients) # Save reduced gradients for different num clusters later
     print(f"Saved reduced gradients with shape {stacked_gradients.shape} to reduced_gradients_stack.npy")
     
     # Cluster the gradient features

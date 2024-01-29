@@ -58,7 +58,7 @@ def merge_adapter_checkpoints(model_name, adapter_path):
         # device_map=device_map,
     )
     
-    epochs = [1, 2, 3]
+    epochs = [1, 2, 3, 4]
     
     for epoch in epochs:
         epoch_num = "epoch_" + str(epoch)
@@ -91,6 +91,6 @@ def merge_adapter_checkpoints(model_name, adapter_path):
         
 # save_model("adapter", model_name, adapter_path, new_model)
 
-model_name = "meta-llama/Llama-2-7b-hf"
-adapter_model = f"guanaco-7b-r64-a16"
-merge_adapter_checkpoints(model_name, adapter_model)
+# model_name = "meta-llama/Llama-2-7b-hf"
+# adapter_model = f"guanaco-7b-r64-a16"
+# merge_adapter_checkpoints(model_name, adapter_model)
