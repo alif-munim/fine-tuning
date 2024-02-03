@@ -35,8 +35,10 @@ def preprocess_instruct(examples):
 model_name = "meta-llama/Llama-2-7b-hf" # Also try "mistralai/Mistral-7B-v0.1"
 dataset = "guanaco"
 cluster = "cedar"
+save_dir = "/scratch/alif/qlora/data"
 
-num_clusters = 2  # Adjust the number of clusters as needed
+num_clusters = 4  # Adjust the number of clusters as needed
+n_components = 16
 cluster_strategy = "gradients"
 resume_from_cluster = 0
 
@@ -60,65 +62,13 @@ if cluster == "narval":
         train_dataset = train_dataset.map(preprocess_instruct, batched=True)
     print(f"Training dataset set to: {dataset} from local path: {dataset_path}")
     
-    
-### GRADIENTS ###
-
-
-def compute_gradients_for_batch(batch, tokenizer, model, max_length=None):
-    # Check if tokenizer has a padding token, if not, set it to the eos_token
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    # Tokenize the batch
-    inputs = tokenizer(batch, return_tensors='pt', padding=True, max_length=max_length, truncation=True)
-    inputs = {k: v.to("cuda") for k, v in inputs.items()}
-    
-    # Forward pass
-    outputs = model(**inputs, labels=inputs['input_ids'])
-    loss = outputs.loss
-    model.zero_grad()
-    
-    # Backward pass to get gradients
-    loss.backward()
-    
-    # Collect gradients
-    gradients = []
-    for name, parameter in model.named_parameters():
-        if parameter.requires_grad and parameter.grad is not None:
-            gradients.append(parameter.grad.detach().cpu().numpy().flatten())
-    return np.concatenate(gradients)
-
 
 #### CLUSTERING #########
 
-def cluster_gradients(dataset, num_clusters, batch_size, max_length):
+def cluster_gradients(dataset, num_clusters, n_components):
 
-    # Load the model and tokenizer
-    model_name = "meta-llama/Llama-2-7b-hf"  # replace with your model
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        low_cpu_mem_usage=True,
-        return_dict=True,
-        torch_dtype=torch.float16,
-        device_map="auto",
-    )
-
-    # Set the model to evaluation mode and to the device
-    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # model.to(device)
-    model.eval()
-
-    # Computing gradients for the dataset in batches
-    gradient_features = []
-    for i in tqdm(range(0, len(train_dataset), batch_size), desc='Computing gradients'):
-        batch_texts = train_dataset['text'][i:i+batch_size]
-        batch_gradients = compute_gradients_for_batch(batch_texts, tokenizer, model, max_length)       
-        gradient_features.append(batch_gradients)
-        model.zero_grad()  # Important to clear gradients after processing each batch
-
-    # Convert the list of batch gradient arrays into a single array
-    gradient_features = np.vstack(gradient_features)
+    gradient_path = f"reduced_gradients_stack_pca{n_components}.npy"
+    gradient_features = np.load(gradient_path)
     
     # Cluster the gradient features
     kmeans = KMeans(n_clusters=num_clusters, random_state=0)
@@ -126,7 +76,7 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
     cluster_labels = kmeans.labels_
 
     # Create the clustered dataset
-    clustered_data = pd.DataFrame({'text': train_dataset['text'], 'cluster': cluster_labels})
+    clustered_data = pd.DataFrame({'text': dataset['text'], 'cluster': cluster_labels})
     return clustered_data
 
 def cluster_embeddings(dataset, num_clusters, embeddings):    
@@ -174,12 +124,11 @@ if cluster_strategy == "embeddings":
 elif cluster_strategy == "tfid":
     clustered_data = cluster_tfid(train_dataset, num_clusters)
 elif cluster_strategy == "gradients":
-    batch_size = 6
-    max_length = 1024
-    clustered_data = cluster_gradients(train_dataset, num_clusters, batch_size, max_length)
-    save_path = f"gradient_clusters_{num_clusters}.csv" 
-    clustered_data.to_csv(save_path)
-    print(f"Clustered data using model gradients and saved dataframe to {save_path}")
+    cluster_strategy = f"{cluster_strategy}_pca{n_components}"
+    clustered_data = cluster_gradients(train_dataset, num_clusters, n_components)
+    # save_path = f"gradient_clusters_{num_clusters}_pca{n_components}.csv" 
+    # clustered_data.to_csv(save_path)
+    # print(f"Clustered data using model gradients and saved dataframe to {save_path}")
 
 unique_clusters = clustered_data['cluster'].unique()
 cluster_datasets = {}
@@ -200,6 +149,6 @@ for cluster_label, cluster_dataset in islice(cluster_datasets.items(), resume_fr
     print(f'({count}/{total}) Saving {cluster_label} for {dataset} dataset...')
     print(cluster_dataset[0])
     dataset_length = len(cluster_dataset)    
-    dataset_name = f"data/{dataset}_{num_clusters}_{cluster_label}_{dataset_length}.json"
+    dataset_name = f"{save_dir}/{dataset}_{cluster_strategy}_{num_clusters}_{cluster_label}_{dataset_length}.json"
     cluster_dataset.to_json(dataset_name)
     count += 1

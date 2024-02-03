@@ -388,16 +388,16 @@ if __name__ == "__main__":
     
     # To merge all model parameters, leave the array empty
     # For specific parameters, enter substrings (e.g. 'lora', 'attn')
-    select_params = ['lora']
+    select_params = ['lora', 'attn']
     
-    compute_fishers = False
+    compute_fishers = True
     skip_merge = False
     use_conjugate_gradient = False
     debug_mode = True
     
-    model_lambda_factor = 6
+    model_lambda_factor = 3
     model_lambda = 0.1 * model_lambda_factor
-    epoch_num = 3
+    epoch_num = 1
     
     initialization = "average"
     num_iters = 100
@@ -677,6 +677,8 @@ if __name__ == "__main__":
 
             for param_name, param in final_nonmerged_model.items():
                 final_model[param_name] = param
+                
+            merged_path = os.path.join('merged_models/', merged_descriptor + '-cg' + ".pt")
                 
             torch.save(final_model, merged_path)
             print(f'Merged models and saved state dict to {merged_path}')

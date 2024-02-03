@@ -20,8 +20,8 @@ model_dirs = [d for d in os.listdir('.') if model_name_pattern in d and 'cluster
 base_model_name = "meta-llama/Llama-2-7b-hf"
 base_model = AutoModelForCausalLM.from_pretrained(base_model_name, torch_dtype=torch.float32)
 
-select_groups = [2, 4]
-epoch_num = 3
+select_groups = [2]
+epoch_num = 1
 epoch_path = f"epoch_{epoch_num}"
 
 # Process each group of models
@@ -73,3 +73,9 @@ for group in set(match.group(1) for d in model_dirs if (match := pattern.match(d
     adapter_path = avg_adapter_dir
     save_model("adapter", base_model_name, adapter_path, output_dir)
     print(f"Successfully saved averaged model at {output_dir}!")
+    
+    try:
+        shutil.rmtree(adapter_path)
+        print(f"Directory {adapter_path} has been removed")
+    except OSError as e:
+        print(f"Error: {e.strerror}")

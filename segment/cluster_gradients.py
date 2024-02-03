@@ -35,39 +35,14 @@ from joblib import dump, load
 import gc
 from functools import partial
 
+# from cuml.decomposition import IncrementalPCA
+# import cupy as cp
+# import cupyx
+
 def preprocess_instruct(examples):
     # Concatenate 'prompt' and 'completion' fields
     texts = [prompt + " " + completion for prompt, completion in zip(examples['prompt'], examples['completion'])]
-    return {'text': texts}
-
-model_name = "meta-llama/Llama-2-7b-hf" # Also try "mistralai/Mistral-7B-v0.1"
-dataset = "guanaco"
-cluster = "cedar"
-
-num_clusters = 2  # Adjust the number of clusters as needed
-cluster_strategy = "gradients"
-resume_from_cluster = 0
-
-if cluster == "cedar":
-    if dataset == "guanaco":
-        dataset_name = "timdettmers/openassistant-guanaco"
-        train_dataset = load_dataset(dataset_name, split="train")
-    elif dataset == "instruct":
-        dataset_name = "monology/VMware-open-instruct-higgsfield"
-        train_dataset = load_dataset(dataset_name, split="train")
-        train_dataset = train_dataset.map(preprocess_instruct, batched=True)
-    print(f"Training dataset set to {dataset_name} from hugging face")
-
-if cluster == "narval":
-    if dataset == "guanaco":
-        dataset_path = "/scratch/alif/timdettmers___json/timdettmers--openassistant-guanaco-c93588435bc90172/0.0.0/fe5dd6ea2639a6df622901539cb550cf8797e5a6b2dd7af1cf934bed8e233e6e/json-train.arrow"
-        train_dataset = Dataset.from_file(dataset_path)
-    elif dataset == "instruct":
-        dataset_path = '/scratch/alif/monology___v_mware-open-instruct-higgsfield/default/0.0.0/622a7cf65a222fcb/v_mware-open-instruct-higgsfield-train.arrow'
-        train_dataset = Dataset.from_file(dataset_path)
-        train_dataset = train_dataset.map(preprocess_instruct, batched=True)
-    print(f"Training dataset set to: {dataset} from local path: {dataset_path}")
-    
+    return {'text': texts}  
     
     
     
@@ -99,7 +74,6 @@ def get_tokenized_dataloader(tokenized_dataset, tokenizer, batch_size):
         batch_size=batch_size, 
         collate_fn=data_collator 
     )
-    
     return dataloader
 
     
@@ -151,7 +125,7 @@ def manage_ipca_checkpoints(ipca_model_name, step_count, ipca, max_checkpoints=1
     
 #### CLUSTERING #########
 
-def cluster_gradients(dataset, num_clusters, batch_size, max_length):
+def cluster_gradients(dataset, num_clusters, batch_size, max_length, compute_pca=True, ipca_checkpoint_step=None):
 
     # For PCA, n_components must be less or equal to batch_size
     n_components = batch_size
@@ -235,11 +209,14 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
     gradient_buffer = []
     gradient_buffer_size = batch_size  # The desired buffer size
     expected_batch_size = batch_size
-
-    compute_pca = False
-    load_ipca_checkpoint = True
+    
+    if ipca_checkpoint_step is None:
+        load_ipca_checkpoint = False
+    else:
+        load_ipca_checkpoint = True
+        
     ipca_model_name = f"bs{batch_size}_ml{max_length}_lmhead_ipca" # ["ipca_model", "b1_lmhead_ipca"]
-    ipca_checkpoint_step = 1231
+    # ipca_checkpoint_step = 1231
     ipca_checkpoint = f"{ipca_model_name}_{ipca_checkpoint_step}.joblib" 
     
     print(f"""
@@ -247,7 +224,7 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
 
         Compute IPCA: {compute_pca}
         Load IPCA Checkpoint: {load_ipca_checkpoint}
-        IPCA Checkpoint Path: {ipca_checkpoint}
+        IPCA Checkpoint Step: {ipca_checkpoint_step}
         Num Components: {n_components}
         Batch Size: {batch_size}
         Gradient Buffer Size: {gradient_buffer_size}
@@ -333,35 +310,169 @@ def cluster_gradients(dataset, num_clusters, batch_size, max_length):
     return clustered_data
 
 
+# Function to fit IncrementalPCA and calculate cumulative explained variance
+def cumulative_explained_variance(X, n_components, batch_size):
+    ipca = IncrementalPCA(n_components=n_components, batch_size=batch_size)
+    ipca.fit(X)
+    explained_variance_ratio = ipca.explained_variance_ratio_
+    cumulative_variance_ratio = cp.cumsum(explained_variance_ratio).get()
+    return cumulative_variance_ratio, ipca
 
-
-
-batch_size = 8
-max_length = 128
-clustered_data = cluster_gradients(train_dataset, num_clusters, batch_size, max_length)
-save_path = f"gradient_clusters_{num_clusters}.csv" 
-clustered_data.to_csv(save_path)
-print(f"Clustered data using model gradients and saved dataframe to {save_path}")
-
-unique_clusters = clustered_data['cluster'].unique()
-cluster_datasets = {}
-
-# Loop through each cluster and create datasets
-for cluster_label in unique_clusters:
-    cluster_df = clustered_data[clustered_data['cluster'] == cluster_label]
-    cluster_datasets[f"cluster_{cluster_label}"] = Dataset.from_pandas(cluster_df)
+# Function to find the number of components that explain at least the target variance
+def find_n_components(X, target_variance, batch_size):
+    n_components = 2  # start with 2 components, or a reasonable guess
+    cumulative_variance_ratio, ipca = cumulative_explained_variance(X, n_components, batch_size)
     
-# Sort the cluster numerically
-cluster_datasets = dict(sorted(cluster_datasets.items()))  
-
-count = 1
-total = len(cluster_datasets.items())
-
-for cluster_label, cluster_dataset in islice(cluster_datasets.items(), resume_from_cluster, total, 1):   
+    # Increase n_components until target_variance is met
+    while cumulative_variance_ratio[-1] < target_variance and n_components < X.shape[1]:
+        n_components += 1
+        cumulative_variance_ratio, ipca = cumulative_explained_variance(X, n_components, batch_size)
     
-    print(f'({count}/{total}) Saving {cluster_label} for {dataset} dataset...')
-    print(cluster_dataset[0])
-    dataset_length = len(cluster_dataset)    
-    dataset_name = f"data/{dataset}_{num_clusters}_{cluster_label}_{dataset_length}.json"
-    cluster_dataset.to_json(dataset_name)
-    count += 1
+    return n_components, ipca       
+
+
+
+
+
+
+
+
+
+def main(num_clusters, num_components, max_length, test_pca=False, compute_pca=True, ipca_checkpoint_step=None):
+    
+    model_name = "meta-llama/Llama-2-7b-hf" # Also try "mistralai/Mistral-7B-v0.1"
+    dataset = "guanaco"
+    cluster = "cedar"
+ 
+    cluster_strategy = "gradients"
+    resume_from_cluster = 0
+    
+
+    if cluster == "cedar":
+        if dataset == "guanaco":
+            dataset_name = "timdettmers/openassistant-guanaco"
+            train_dataset = load_dataset(dataset_name, split="train")
+        elif dataset == "instruct":
+            dataset_name = "monology/VMware-open-instruct-higgsfield"
+            train_dataset = load_dataset(dataset_name, split="train")
+            train_dataset = train_dataset.map(preprocess_instruct, batched=True)
+        print(f"Training dataset set to {dataset_name} from hugging face")
+
+    if cluster == "narval":
+        if dataset == "guanaco":
+            dataset_path = "/scratch/alif/timdettmers___json/timdettmers--openassistant-guanaco-c93588435bc90172/0.0.0/fe5dd6ea2639a6df622901539cb550cf8797e5a6b2dd7af1cf934bed8e233e6e/json-train.arrow"
+            train_dataset = Dataset.from_file(dataset_path)
+        elif dataset == "instruct":
+            dataset_path = '/scratch/alif/monology___v_mware-open-instruct-higgsfield/default/0.0.0/622a7cf65a222fcb/v_mware-open-instruct-higgsfield-train.arrow'
+            train_dataset = Dataset.from_file(dataset_path)
+            train_dataset = train_dataset.map(preprocess_instruct, batched=True)
+        print(f"Training dataset set to: {dataset} from local path: {dataset_path}")
+    
+    if not test_pca:
+        print(f"""
+            Fitting PCA with the following configs:
+            Checkpoint Step: {ipca_checkpoint_step}
+            Compute PCA: {compute_pca}
+            Num Clusters: {num_clusters}
+            Num Components: {num_components}
+            Max Seq Length: {max_length}
+        """)
+        
+        clustered_data = cluster_gradients(train_dataset, num_clusters, num_components, max_length, compute_pca, ipca_checkpoint_step)
+        save_path = f"gradient_clusters_{num_clusters}.csv" 
+        clustered_data.to_csv(save_path)
+        print(f"Clustered data using model gradients and saved dataframe to {save_path}")
+
+        unique_clusters = clustered_data['cluster'].unique()
+        cluster_datasets = {}
+
+        # Loop through each cluster and create datasets
+        for cluster_label in unique_clusters:
+            cluster_df = clustered_data[clustered_data['cluster'] == cluster_label]
+            cluster_datasets[f"cluster_{cluster_label}"] = Dataset.from_pandas(cluster_df)
+
+        # Sort the cluster numerically
+        cluster_datasets = dict(sorted(cluster_datasets.items()))  
+
+        count = 1
+        total = len(cluster_datasets.items())
+
+        for cluster_label, cluster_dataset in islice(cluster_datasets.items(), resume_from_cluster, total, 1):   
+
+            print(f'({count}/{total}) Saving {cluster_label} for {dataset} dataset...')
+            print(cluster_dataset[0])
+            dataset_length = len(cluster_dataset)    
+            dataset_name = f"data/{dataset}_{num_clusters}_{cluster_label}_{dataset_length}.json"
+            cluster_dataset.to_json(dataset_name)
+            count += 1
+    else:
+        print(f"Finding ideal number of (incremental) PCA components for gradient reduction.")
+        
+        # Load the model and tokenizer
+#         model = AutoModelForCausalLM.from_pretrained(
+#             model_name,
+#             low_cpu_mem_usage=True,
+#             return_dict=True,
+#             torch_dtype=torch.float16,
+#             device_map="auto",
+#         )
+#         model.eval()
+
+#         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+#         tokenizer.pad_token = tokenizer.eos_token
+#         tokenizer.padding_side = "right"
+
+#         tokenized_dataset = dataset.map(
+#             partial(tokenize_function, tokenizer=tokenizer, max_length=max_length), 
+#             batched=True,
+#         )
+#         tokenized_dataset = tokenized_dataset.map(
+#             lambda examples: {'input_ids': examples['input_ids'], 'attention_mask': examples['attention_mask']},
+#             batched=True,
+#             remove_columns=tokenized_dataset.column_names  # This removes all columns except the ones specified above
+#         )
+#         tokenized_dataset = tokenized_dataset.map(shift_labels_right, batched=True)
+#         print(f"Tokenized dataset length: {len(tokenized_dataset)}")
+
+#         dataloader_batch_size = 8
+#         dataloader = get_tokenized_dataloader(tokenized_dataset, tokenizer, dataloader_batch_size)
+#         iterator = iter(dataloader)
+#         buffer_size = 32
+
+#         for i in range(buffer_size):
+#             batch = next(iterator)
+#             batch_gradients = aggregate_gradients_for_batch(batch, model, max_length)
+#             gradient_buffer.append(batch_gradients)
+
+#         gradient_list = np.vstack(gradient_buffer)
+#         print(f"gradient_list (batch): {gradient_list.shape}")
+#         # ipca.partial_fit(gradient_list)
+
+#         # Example usage:
+#         # X = cupyx.scipy.sparse.random(1000, 4, format='csr', density=0.07, random_state=5)
+#         X = gradient_list
+#         target_variance = 0.95
+#         pca_batch_size = 8
+
+#         n_components, ipca = find_n_components(X, target_variance, batch_size)
+
+#         print(f"Number of components to explain {target_variance*100}% of variance: {n_components}")
+#         print(f"Cumulative explained variance ratio: {ipca.explained_variance_ratio_.get()}")
+
+#         del gradient_list  # Delete the variable holding the tensor
+#         del gradient_buffer
+#         torch.cuda.empty_cache()  # Release GPU memory
+#         gc.collect()
+#         gradient_buffer = []  # Clear the buffer
+
+
+if __name__ == "__main__":
+    
+    num_clusters = 2  # Adjust the number of clusters as needed
+    num_components = 5 # Number of PCA components
+    max_length = 128 # Max sequence length for each input
+    
+    ipca_checkpoint_step = 1500
+    
+    main(num_clusters, num_components, max_length, test_pca=False, compute_pca=True, ipca_checkpoint_step=ipca_checkpoint_step)
+    
