@@ -408,71 +408,73 @@ def main(cluster_name, dataset, num_clusters, num_components, max_length, test_p
         print(f"Finding ideal number of (incremental) PCA components for gradient reduction.")
         
         # Load the model and tokenizer
-#         model = AutoModelForCausalLM.from_pretrained(
-#             model_name,
-#             low_cpu_mem_usage=True,
-#             return_dict=True,
-#             torch_dtype=torch.float16,
-#             device_map="auto",
-#         )
-#         model.eval()
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            low_cpu_mem_usage=True,
+            return_dict=True,
+            torch_dtype=torch.float16,
+            device_map="auto",
+        )
+        model.eval()
 
-#         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-#         tokenizer.pad_token = tokenizer.eos_token
-#         tokenizer.padding_side = "right"
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
 
-#         tokenized_dataset = dataset.map(
-#             partial(tokenize_function, tokenizer=tokenizer, max_length=max_length), 
-#             batched=True,
-#         )
-#         tokenized_dataset = tokenized_dataset.map(
-#             lambda examples: {'input_ids': examples['input_ids'], 'attention_mask': examples['attention_mask']},
-#             batched=True,
-#             remove_columns=tokenized_dataset.column_names  # This removes all columns except the ones specified above
-#         )
-#         tokenized_dataset = tokenized_dataset.map(shift_labels_right, batched=True)
-#         print(f"Tokenized dataset length: {len(tokenized_dataset)}")
+        tokenized_dataset = train_dataset.map(
+            partial(tokenize_function, tokenizer=tokenizer, max_length=max_length), 
+            batched=True,
+        )
+        tokenized_dataset = tokenized_dataset.map(
+            lambda examples: {'input_ids': examples['input_ids'], 'attention_mask': examples['attention_mask']},
+            batched=True,
+            remove_columns=tokenized_dataset.column_names  # This removes all columns except the ones specified above
+        )
+        tokenized_dataset = tokenized_dataset.map(shift_labels_right, batched=True)
+        print(f"Tokenized dataset length: {len(tokenized_dataset)}")
 
-#         dataloader_batch_size = 8
-#         dataloader = get_tokenized_dataloader(tokenized_dataset, tokenizer, dataloader_batch_size)
-#         iterator = iter(dataloader)
-#         buffer_size = 32
+        # Start with 2 components        
+        num_batches = 3
+        num_components = num_components
+        buffer_size = num_components
+        dataloader_batch_size = 8
+        dataloader = get_tokenized_dataloader(tokenized_dataset, tokenizer, dataloader_batch_size)
+        iterator = iter(dataloader)
+        
+        target_variance = 0.95
+        ipca = IncrementalPCA(n_components=num_components)
+        gradient_buffer = []
+        for i in tqdm(range(num_batches), desc=f"Performing partial fits for {num_batches} batches of {num_components} gradients"):
+            for i in range(buffer_size):
+                batch = next(iterator)
+                batch_gradients = aggregate_gradients_for_batch(batch, model, max_length)
+                gradient_buffer.append(batch_gradients)
 
-#         for i in range(buffer_size):
-#             batch = next(iterator)
-#             batch_gradients = aggregate_gradients_for_batch(batch, model, max_length)
-#             gradient_buffer.append(batch_gradients)
-
-#         gradient_list = np.vstack(gradient_buffer)
-#         print(f"gradient_list (batch): {gradient_list.shape}")
-#         # ipca.partial_fit(gradient_list)
-
-#         # Example usage:
-#         # X = cupyx.scipy.sparse.random(1000, 4, format='csr', density=0.07, random_state=5)
-#         X = gradient_list
-#         target_variance = 0.95
-#         pca_batch_size = 8
-
-#         n_components, ipca = find_n_components(X, target_variance, batch_size)
-
-#         print(f"Number of components to explain {target_variance*100}% of variance: {n_components}")
-#         print(f"Cumulative explained variance ratio: {ipca.explained_variance_ratio_.get()}")
-
-#         del gradient_list  # Delete the variable holding the tensor
-#         del gradient_buffer
-#         torch.cuda.empty_cache()  # Release GPU memory
-#         gc.collect()
-#         gradient_buffer = []  # Clear the buffer
+            gradient_list = np.vstack(gradient_buffer)
+            ipca.partial_fit(gradient_list)
+            
+            del gradient_list  # Delete the variable holding the tensor
+            del gradient_buffer
+            torch.cuda.empty_cache()  # Release GPU memory
+            gc.collect()
+            gradient_buffer = []  # Clear the buffer
+        
+        explained_variance_ratio = ipca.explained_variance_ratio_
+        cumulative_variance_ratio = np.cumsum(explained_variance_ratio)[-1]
+        
+        # print(f"Number of components to explain {target_variance*100}% of variance: {num_components}")
+        print(f"IPCA explained variance ratio: {explained_variance_ratio}")
+        print(f"Cumulative explained variance ratio: {cumulative_variance_ratio}")
 
 
 if __name__ == "__main__":
     
     num_clusters = 2  # Adjust the number of clusters as needed
-    num_components = 5 # Number of PCA components
+    num_components = 12 # Number of PCA components
     max_length = 128 # Max sequence length for each input
     
     ipca_checkpoint_step = 1970
-    test_pca = False
+    test_pca = True
     compute_pca = False
     
     cluster_name = "narval"

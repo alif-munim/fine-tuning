@@ -6,7 +6,7 @@ from safetensors import safe_open # for checkpoint loading
 from safetensors.torch import load_model, save_model, load_file
 from safetensors.torch import load as load_safetensors
 
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
