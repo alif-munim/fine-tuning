@@ -338,11 +338,10 @@ def find_n_components(X, target_variance, batch_size):
 
 
 
-def main(num_clusters, num_components, max_length, test_pca=False, compute_pca=True, ipca_checkpoint_step=None):
+def main(cluster_name, dataset, num_clusters, num_components, max_length, test_pca=False, compute_pca=True, ipca_checkpoint_step=None):
     
     model_name = "meta-llama/Llama-2-7b-hf" # Also try "mistralai/Mistral-7B-v0.1"
-    dataset = "guanaco"
-    cluster = "cedar"
+    cluster = cluster_name
  
     cluster_strategy = "gradients"
     resume_from_cluster = 0
@@ -402,7 +401,7 @@ def main(num_clusters, num_components, max_length, test_pca=False, compute_pca=T
             print(f'({count}/{total}) Saving {cluster_label} for {dataset} dataset...')
             print(cluster_dataset[0])
             dataset_length = len(cluster_dataset)    
-            dataset_name = f"data/{dataset}_{num_clusters}_{cluster_label}_{dataset_length}.json"
+            dataset_name = f"data/{dataset}_pca{num_components}_{num_clusters}_{cluster_label}_{dataset_length}.json"
             cluster_dataset.to_json(dataset_name)
             count += 1
     else:
@@ -472,7 +471,12 @@ if __name__ == "__main__":
     num_components = 5 # Number of PCA components
     max_length = 128 # Max sequence length for each input
     
-    ipca_checkpoint_step = 1500
+    ipca_checkpoint_step = 1970
+    test_pca = False
+    compute_pca = False
     
-    main(num_clusters, num_components, max_length, test_pca=False, compute_pca=True, ipca_checkpoint_step=ipca_checkpoint_step)
+    cluster_name = "narval"
+    dataset = "guanaco"
+    
+    main(cluster_name, dataset, num_clusters, num_components, max_length, test_pca=test_pca, compute_pca=compute_pca, ipca_checkpoint_step=ipca_checkpoint_step)
     
